@@ -250,3 +250,76 @@ test('legacy bookmarks resolve by exact title; ambiguous matches are refused', a
   duplicates = true;
   await assert.rejects(source.appId('/anime/another.html', { title: '新宝可梦' }), /唯一/);
 });
+
+function comment(p, id, { status = 2, html = '', text = '评论 🌸', replies = 0 } = {}) {
+  return p.protobuf([[1, id], [3, p.protobuf([[2, '读者 🌸']])], [7, text],
+    [8, p.protobuf([[1, html]])], [11, 3], [13, replies], [14, status],
+    [16, p.protobuf([[1, 1700000000], [2, 500000000]])]]);
+}
+
+test('work comments decode threads, Unicode, HTML images and approval status safely', async () => {
+  const source = appSource(async (method, data, p) => {
+    assert.equal(method, 'ListComments');
+    assert.equal(p.protoText(data, 1), 'vod');
+    assert.equal(data[2][0], 2772);
+    assert.equal(data[3], undefined); // Work-wide: never sends an episode key.
+    assert.equal(data[5][0], 20);
+    const approved = comment(p, 100, { html: '<p>你好 &amp; 🌸</p><br>第二行' +
+      '<script>ignored()</script><img src="https://images.example/a.png?x=1&amp;y=2">' +
+      '<img src="https://images.example/a.png?x=1&amp;y=2"><img src="file:///private.png">', replies: 2 });
+    const hidden = comment(p, 99, { status: 1, html: '<b>待审核</b><img src="https://images.example/hidden.png">' });
+    return p.protobuf([[1, p.protobuf([[1, approved]])], [1, p.protobuf([[1, approved]])],
+      [1, p.protobuf([[1, hidden]])], [1, p.protobuf([[2, approved]])]]);
+  });
+  const page = await source.comments('/app/vod/2772', '/ignored-episode', 1);
+  assert.equal(page.comments.length, 2);
+  const row = page.comments[0];
+  assert.equal(row.id, '100'); assert.equal(row.username, '读者 🌸');
+  assert.equal(row.text, '你好 & 🌸\n第二行');
+  assert.equal(row.time, '2023-11-14T22:13:20.000Z');
+  assert.equal(row.likes, 3); assert.equal(row.replyCount, 2); assert.equal(row.hidden, false);
+  assert.deepEqual(Array.from(row.images), ['https://images.example/a.png?x=1&y=2']);
+  assert.equal(page.comments[1].hidden, true); assert.equal(page.comments[1].text, '');
+  assert.equal(page.comments[1].images.length, 0); assert.equal(page.hasMore, false);
+});
+
+test('root and reply comments have independent ID cursors, end detection and refresh', async () => {
+  const requests = [];
+  const source = appSource(async (method, data, p) => {
+    const reply = method === 'ListReplies', cursor = data[reply ? 2 : 4][0];
+    if (reply) { assert.equal(data[1][0], 100); assert.equal(data[3][0], 20); }
+    requests.push([method, cursor]);
+    const bytes = comment(p, reply ? 98 : cursor ? 80 : 100);
+    return p.protobuf([[1, reply ? bytes : p.protobuf([[1, bytes]])], [2, reply || cursor ? 0 : 80]]);
+  });
+  assert.equal((await source.comments('/app/vod/2772', 'episode1', 1)).hasMore, true);
+  const reply = await source.comments('/app/vod/2772', '', 1, '100');
+  assert.equal(reply.comments[0].id, '98'); assert.equal(reply.hasMore, false);
+  assert.equal((await source.comments('/app/vod/2772', 'episode2', 2)).comments[0].id, '80');
+  assert.equal((await source.comments('/app/vod/2772', '', 3)).comments.length, 0);
+  assert.equal((await source.comments('/app/vod/2772', '', 2, '100')).comments.length, 0);
+  await source.comments('/app/vod/2772', '', 1);
+  assert.deepEqual(requests, [['ListComments', 0], ['ListReplies', 0], ['ListComments', 80], ['ListComments', 0]]);
+  await assert.rejects(source.comments('/app/vod/2772', '', 9), /第一页/);
+  await assert.rejects(source.comments('/app/vod/2772', '', 0), /页码/);
+  await assert.rejects(source.comments('/app/vod/2772', '', 1, '-1'), /评论编号/);
+  await assert.rejects(source.comments('https://other.example/app/vod/2772', '', 1), /作品地址/);
+});
+
+test('comments stop on repeated cursors and surface read failures instead of empty success', async () => {
+  const source = appSource(async (_, data, p) => p.protobuf([[2, 80]]));
+  assert.equal((await source.comments('/app/vod/2772', '', 1)).hasMore, true);
+  assert.equal((await source.comments('/app/vod/2772', '', 2)).hasMore, false);
+  source.grpcRequest = async () => { throw new Error('connection failed'); };
+  await assert.rejects(source.comments('/app/vod/2772', '', 1), /connection failed/);
+});
+
+test('legacy work comments use the ID resolved by the detail page', async () => {
+  const source = appSource(async (method, data, p) => {
+    if (method === 'SearchVods') return p.protobuf([[2, p.protobuf([[1, 2772], [2, '新宝可梦']])]]);
+    assert.equal(method, 'ListComments'); assert.equal(data[2][0], 2772);
+    return p.protobuf([[1, p.protobuf([[1, comment(p, 100)]])]]);
+  });
+  await source.appId(work, { title: '新宝可梦' });
+  assert.equal((await source.comments(work, episode, 1)).comments[0].id, '100');
+});

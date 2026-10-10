@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         Omofun 动漫
-// @version      v1.1.0
+// @version      v1.1.1
 // @minAppVersion 1.4.2
 // @author       FusionReader
 // @lang         zh
@@ -10,16 +10,18 @@
 // @icon         https://www.omofuna.com/template/the4/statics/img/favicon.ico
 // @webSite      https://www.omofuna.com
 // @nsfw         false
+// @comments     work
 // ==/MiruExtension==
 
 export default class extends Extension {
 
   // Public read-only gRPC API used by the official desktop client 2.0.1.
-  // No account token or shared signing secret is required by these methods.
+  // Public content, danmaku and comment reads need no login or signing secret.
   _apiHosts = ['trans.gavhscnmj.cc', 'backed.233dm.com'];
   _apiHost = '';
   _cursors = new Map();
   _appIds = new Map();
+  _commentCursors = new Map();
   _certificate = "-----BEGIN CERTIFICATE-----\nMIIDSzCCAjMCFHIXUZ02Sox1yN7Tn3s2u56y2NdOMA0GCSqGSIb3DQEBCwUAMGEx\nCzAJBgNVBAYTAlVTMQswCQYDVQQIDAJVUzELMAkGA1UEBwwCVVMxCzAJBgNVBAoM\nAlVTMQswCQYDVQQLDAJVUzELMAkGA1UEAwwCVVMxETAPBgkqhkiG9w0BCQEWAlVT\nMCAXDTI0MTIwNDE0MzczOVoYDzMwMjQwNDA2MTQzNzM5WjBhMQswCQYDVQQGEwJV\nUzELMAkGA1UECAwCVVMxCzAJBgNVBAcMAlVTMQswCQYDVQQKDAJVUzELMAkGA1UE\nCwwCVVMxCzAJBgNVBAMMAlVTMREwDwYJKoZIhvcNAQkBFgJVUzCCASIwDQYJKoZI\nhvcNAQEBBQADggEPADCCAQoCggEBAK3bPHV2iVxeM2HOLLLF4Ee2CLO9P0xIHfyi\n7Ij//5u2nzQe64twOdMi53VUt9sGpotV2+Ccwc87G0XCQ4T/KiTczqY02cWw7Nou\nskn2q+oKUb2GjBFr+i/APUsqgraWWftlukpHkD027ce/6BY+CNWtthRQ5C5MJgeR\niYAbvQHz8g3QwcCPxhVSZgZyvabbJZz3FQk+0DoVC6ZL4863lncyISfQNLwiYuhF\n2VzjG4KtKMMD/XNXEgj9LMTwEMEoccBt6F0smdVbyB+afbxdyjEx8jse38gIlYoq\n1UPfqeEPk094dbOgEbMnMcwxQnCSmTt9/MQiFig4ZT7SENQc4AkCAwEAATANBgkq\nhkiG9w0BAQsFAAOCAQEAL0P/le9n8caiScetUmv27E3ecFt4rXe1W4E45EkawNAP\nTyOW7i+pbs5ymQXBVkqh7OGbIU/c9LauuQjtxg8ngrQwYgteLBaRbOLeqjsz0eGg\nCEGCO9OPawkMkAbf7G/AVYNaOkSPNM+K2m/+XwscxXUqhJ8rRo/uMnnGQu25IHYG\ndWQjXBapKoxnuSmVRCvSv6F1WsSXzY+hIDRqfSInIguyK91tIA2cGYeE/Zm7xdC+\nDoUj6pqaI6/qzRNF5KJmdHAJwcgxQu9tHpXak+OsaVWpMXoFJSQrl7+K60Enr429\nsmasHvi9tYg1MIB5cxOgtjsHWMYbE1O6UW4CY4UHug==\n-----END CERTIFICATE-----\n";
 
   protobuf(fields) {
@@ -201,6 +203,60 @@ export default class extends Extension {
       return [(row[3]?.[0] || 0) / 1000, effect === 'top' ? 1 : effect === 'bottom' ? 2 : 0,
         color, '', this.protoText(row, 4)];
     });
+  }
+
+
+  commentData(bytes) {
+    const data = this.protoRead(bytes), author = this.protoRead(data[3]?.[0] || []);
+    const rendered = this.protoRead(data[8]?.[0] || []);
+    const html = this.protoText(rendered, 1);
+    const timestamp = this.protoRead(data[16]?.[0] || []);
+    const seconds = timestamp[1]?.[0] || 0;
+    const hidden = data[14]?.[0] !== 2;
+    const images = [];
+    if (!hidden) {
+      for (const match of html.matchAll(/<img\b([^>]*)>/gi)) {
+        const url = this.attr(match[1], 'src');
+        if (/^https?:\/\//i.test(url) && !images.includes(url)) images.push(url);
+      }
+    }
+    return { id: String(data[1]?.[0] || ''), username: this.protoText(author, 2) || '匿名用户',
+      text: hidden ? '' : this.text(html || this.protoText(data, 7)),
+      time: seconds > 0 && seconds < 8640000000000 ? new Date(seconds * 1000).toISOString() : '',
+      likes: data[11]?.[0] || 0, replyCount: data[13]?.[0] || 0, hidden,
+      images: images.slice(0, 20) };
+  }
+
+  async comments(workUrl, chapterUrl, page, parentId) {
+    this.pageNumber(page);
+    const path = this.path(workUrl);
+    if (!/^\/(?:app\/vod\/[1-9]\d*|anime\/[a-z0-9]+\.html)$/.test(path)) throw new Error('无效作品地址。');
+    const id = await this.appId(path);
+    const parent = parentId ? Number(parentId) : 0;
+    if (parentId && (!Number.isSafeInteger(parent) || parent <= 0)) throw new Error('无效评论编号。');
+    const key = id + ':' + parent;
+    // The API uses ID cursors, not page offsets. Root threads and each reply
+    // list retain independent cursors, and page 1 always starts a fresh read.
+    if (page === 1) this._commentCursors.set(key, new Map([[1, 0]]));
+    const cursors = this._commentCursors.get(key);
+    if (!cursors?.has(page)) throw new Error('请从第一页开始加载评论。');
+    const cursor = cursors.get(page);
+    if (cursor === null) return { comments: [], hasMore: false };
+    const response = await this.appCall('comment.v1.CommentService', parent ? 'ListReplies' : 'ListComments',
+      parent ? [[1, parent], [2, cursor], [3, 20]] : [[1, 'vod'], [2, id], [4, cursor], [5, 20]]);
+    const rows = [];
+    const seen = new Set();
+    for (const bytes of response[1] || []) {
+      const root = parent ? bytes : this.protoRead(bytes)[1]?.[0];
+      if (!root) continue;
+      const comment = this.commentData(root);
+      if (comment.id && comment.id !== '0' && !seen.has(comment.id)) { seen.add(comment.id); rows.push(comment); }
+    }
+    const next = response[2]?.[0] || 0;
+    const hasMore = Number.isSafeInteger(next) && next > 0 && next !== cursor;
+    cursors.set(page + 1, hasMore ? next : null);
+    if (this._commentCursors.size > 50) this._commentCursors.delete(this._commentCursors.keys().next().value);
+    return { comments: rows, hasMore };
   }
 
   _checks = new Map();
