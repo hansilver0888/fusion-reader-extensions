@@ -14,6 +14,7 @@ function extension() {
     .replace('export default class', 'globalThis.Source = class'), context);
   const source = vm.runInContext('new Source()', context);
   source.webSite = origin;
+  source.grpcRequest = undefined;
   return source;
 }
 
@@ -158,4 +159,94 @@ test('expired, intermediary and invalid player URLs have clear errors without ev
   await assert.rejects(source.watch(episode), /已失效/);
   await assert.rejects(source.watch('/anime/other.html'), /集数地址/);
   await assert.rejects(source.detail('https://wrong.example' + work), /作品地址/);
+});
+
+
+function appSource(handler) {
+  const source = extension();
+  source.getSetting = async () => null;
+  source.setSetting = async () => {};
+  source.grpcRequest = async options => {
+    assert.match(options.endpoint, /^https:\/\/[^/]+:9091$/);
+    assert.match(options.certificate, /BEGIN CERTIFICATE/);
+    assert.equal(options.metadata.authorization, undefined);
+    assert.equal(options.metadata['x-sign'], undefined);
+    const request = source.protoRead(source.bytesBase64(options.data));
+    return source.binaryBase64(await handler(options.method.split('/').pop(), request, source));
+  };
+  return source;
+}
+
+test('App protobuf handles Unicode, unknown fields and rejects truncated responses', () => {
+  const source = extension();
+  const decoded = source.protoRead(source.protobuf([[1, 2772], [2, '中文 🌸'], [100, 'new field']]));
+  assert.equal(decoded[1][0], 2772);
+  assert.equal(source.protoText(decoded, 2), '中文 🌸');
+  assert.equal(source.protoText(decoded, 100), 'new field');
+  assert.throws(() => source.protoRead([18, 10, 65]), /不完整/);
+  assert.throws(() => source.protobuf([[1, -1]]), /无效/);
+});
+
+test('App pagination follows opaque cursors and stops at the final page', async () => {
+  const requests = [];
+  const source = appSource(async (method, data, p) => {
+    assert.equal(method, 'ListVods');
+    const cursor = p.protoText(data, 8); requests.push(cursor);
+    const row = p.protobuf([[1, 2772], [2, '新宝可梦'], [3, 'https://cover.example/a.jpg']]);
+    return p.protobuf([[2, row], [3, cursor ? '' : 'opaque:next'], [4, cursor ? 0 : 1]]);
+  });
+  assert.equal((await source.latest(1, '1'))[0].url, '/app/vod/2772');
+  assert.equal((await source.latest(2, '1')).length, 1);
+  assert.equal((await source.latest(3, '1')).length, 0);
+  assert.deepEqual(requests, ['', 'opaque:next']);
+  await assert.rejects(source.latest(10, '1'), /第一页/);
+});
+
+test('App detail preserves player names and binds every episode to its numeric ID', async () => {
+  const source = appSource(async (method, data, p) => {
+    assert.equal(method, 'GetVodDetail'); assert.equal(data[1][0], 2772);
+    const episode = p.protobuf([[1, '第01集'], [2, 'unused'], [3, 1]]);
+    const play = p.protobuf([[1, 3], [3, episode]]);
+    const entry = p.protobuf([[1, '天堂'], [2, play]]);
+    return p.protobuf([[1, p.protobuf([[1, 2772], [2, '新宝可梦'], [16, entry]])]]);
+  });
+  const detail = await source.detail('/app/vod/2772');
+  assert.equal(detail.title, '新宝可梦');
+  assert.equal(detail.episodes[0].title, '天堂');
+  assert.equal(detail.episodes[0].urls[0].url, '/app/vod/2772/play/' + encodeURIComponent('天堂') + '/1.html');
+  assert.equal(detail.episodes[0].urls[0].name, '第01集');
+});
+
+test('App play and danmaku use the same work and episode, converting milliseconds and styles', async () => {
+  const source = appSource(async (method, data, p) => {
+    assert.equal(data[1][0], 2772);
+    if (method === 'GetVodPlayUrl') {
+      assert.equal(p.protoText(data, 2), '天堂'); assert.equal(data[3][0], 1);
+      return p.protobuf([[1, 'https://video.example/master.m3u8']]);
+    }
+    assert.equal(method, 'ListBullets'); assert.equal(p.protoText(data, 2), '1');
+    assert.equal(data[3][0], 15000); assert.equal(data[4][0], 195000);
+    const style = p.protobuf([[1, 'color_hex_fe0302'], [2, 'top']]);
+    return p.protobuf([[1, p.protobuf([[3, 1550], [4, '弹幕 🌸'], [5, style]])]]);
+  });
+  const watch = await source.watch('/app/vod/2772/play/' + encodeURIComponent('天堂') + '/1.html');
+  assert.equal(watch.url, 'lavf://https://video.example/master.m3u8');
+  assert.equal(watch.danmaku.url, '2772:1');
+  const rows = await source.danmaku(watch.danmaku.url, 15, 195);
+  assert.deepEqual(Array.from(rows[0]), [1.55, 1, 0xfe0302, '', '弹幕 🌸']);
+  await assert.rejects(source.danmaku('2772:1', 0, 1000), /无效/);
+});
+
+test('legacy bookmarks resolve by exact title; ambiguous matches are refused', async () => {
+  let duplicates = false, searches = 0;
+  const source = appSource(async (method, data, p) => {
+    assert.equal(method, 'SearchVods'); searches++;
+    const exact = p.protobuf([[1, 2772], [2, '新宝可梦']]);
+    return p.protobuf([[2, exact], [2, duplicates ? exact : p.protobuf([[1, 3000], [2, '新宝可梦特别篇']])]]);
+  });
+  assert.equal(await source.appId(work, { title: '新宝可梦' }), 2772);
+  assert.equal(await source.appId(episode, { title: '新宝可梦' }), 2772);
+  assert.equal(searches, 1);
+  duplicates = true;
+  await assert.rejects(source.appId('/anime/another.html', { title: '新宝可梦' }), /唯一/);
 });

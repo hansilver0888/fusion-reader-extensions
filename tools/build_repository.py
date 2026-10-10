@@ -30,6 +30,9 @@ def build(destination, base_url):
             raise ValueError(f'Invalid package: {path.name}')
         if not re.fullmatch(r'v?\d+\.\d+\.\d+', version):
             raise ValueError(f'Invalid version: {path.name}')
+        minimum = fields.get('minAppVersion', '1.4.0')
+        if not re.fullmatch(r'\d+\.\d+\.\d+', minimum):
+            raise ValueError(f'Invalid minimum app version: {path.name}')
         kind = {'fikushon': 'novel', 'bangumi': 'anime'}.get(fields.get('type'), fields.get('type'))
         if kind not in ('manga', 'novel', 'anime'):
             raise ValueError(f'Invalid media type: {path.name}')
@@ -39,7 +42,7 @@ def build(destination, base_url):
         extensions.append(dict(package=package, name=fields.get('name', package), version=version,
             type=kind, lang=fields.get('lang', 'all'), author=fields.get('author', ''),
             icon=fields.get('icon', ''), nsfw=fields.get('nsfw', 'false') == 'true',
-            url='scripts/' + filename, sha256=digest, size=len(data), minAppVersion='1.4.0'))
+            url='scripts/' + filename, sha256=digest, size=len(data), minAppVersion=minimum))
     if not extensions:
         raise ValueError('No plugins to publish')
     manifest = dict(schemaVersion=1, name='FusionReader 插件仓库', website=base_url.rstrip('/') + '/', extensions=extensions)
