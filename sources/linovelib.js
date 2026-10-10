@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         哔哩轻小说
-// @version      v1.3.0
+// @version      v1.3.1
 // @author       FusionReader
 // @lang         zh-cn
 // @license      MIT
@@ -23,6 +23,58 @@ const MOBILE_UA =
 const INCOMPLETE_BODY = /內容加載失敗|内容加载失败|更換瀏覽器|更换浏览器/;
 
 export default class extends Extension {
+  _requestQueue = Promise.resolve();
+  _inflight = new Map();
+  _commentCache = new Map();
+  _nextRequestAt = 0;
+
+  // Reading, caching, catalog loading and comments share one polite queue.
+  // This also works on older hosts, without changing their HTTP bridge.
+  async request(url, options = {}) {
+    const key = JSON.stringify([this.mobileUrl(url), options.method || 'get', options.data || '',
+      !!options.browser, options.headers || {}]);
+    const comments = /\/comment\/php\/api\.php\?action=get_list/.test(url);
+    const cached = comments && this._commentCache.get(key);
+    if (cached && cached.expires > Date.now()) return cached.value;
+    if (this._inflight.has(key)) return this._inflight.get(key);
+
+    const pending = this._requestQueue.then(async () => {
+      const delay = this._nextRequestAt - Date.now();
+      if (delay > 0) await this.sleep(delay);
+      try {
+        let response;
+        try {
+          response = await super.request(url, options);
+        } catch (error) {
+          if (!/\b403\b/.test(String(error))) throw error;
+          if (options.retry === false) throw error;
+          await this.sleep(6000);
+          response = await super.request(url, options);
+        }
+        if (comments) {
+          this._commentCache.set(key, { value: response, expires: Date.now() + 15000 });
+          if (this._commentCache.size > 40) this._commentCache.delete(this._commentCache.keys().next().value);
+        }
+        return response;
+      } catch (error) {
+        if (/\b(?:403|429)\b/.test(String(error))) {
+          this._nextRequestAt = Date.now() + 30000;
+          throw new Error('站点暂时限制访问，请等待约 30 秒再试；已缓存章节可正常阅读。' + String(error));
+        }
+        throw error;
+      } finally {
+        this._nextRequestAt = Math.max(this._nextRequestAt, Date.now() + 1500);
+      }
+    });
+    this._requestQueue = pending.catch(() => {});
+    this._inflight.set(key, pending);
+    try {
+      return await pending;
+    } finally {
+      this._inflight.delete(key);
+    }
+  }
+
   mobileUrl(path) {
     // Existing shelf/history entries may still refer to the desktop domain.
     return this.absoluteUrl(this.webSite + '/', path.replace(

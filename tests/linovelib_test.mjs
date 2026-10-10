@@ -3,14 +3,14 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import { test } from 'node:test';
 
-function extension() {
-  const context = vm.createContext({ sendMessage() {} });
+function extension(clock) {
+  const context = vm.createContext({ sendMessage() {}, Date: clock ? class extends Date { static now() { return clock.now; } } : Date });
   vm.runInContext(fs.readFileSync(new URL('../fixtures/runtime.js', import.meta.url), 'utf8'), context);
   vm.runInContext(fs.readFileSync(new URL('../sources/linovelib.js', import.meta.url), 'utf8')
     .replace('export default class', 'globalThis.Linovelib = class'), context);
   const source = vm.runInContext('new Linovelib()', context);
   source.webSite = 'https://www.bilinovel.net';
-  source.sleep = async () => {};
+  source.sleep = async milliseconds => { if (clock) clock.now += milliseconds; };
   return source;
 }
 
@@ -28,6 +28,79 @@ function pages(source, fixtures) {
 }
 
 const origin = 'https://www.bilinovel.net';
+
+function pacedSource(mockRequest) {
+  const clock = { now: 100000 };
+  const source = extension(clock);
+  Object.getPrototypeOf(Object.getPrototypeOf(source)).request = function (url, options) { return mockRequest(url, options, clock); };
+  return { source, clock };
+}
+
+test('serializes browser chapters and comments, and coalesces identical inflight requests', async () => {
+  const times = [];
+  let release;
+  let active = 0;
+  let maximum = 0;
+  const { source } = pacedSource(async (url, _, clock) => {
+    times.push(clock.now);
+    active++;
+    maximum = Math.max(maximum, active);
+    if (url === '/novel/1/2.html') await new Promise(resolve => { release = resolve; });
+    active--;
+    return url;
+  });
+  const a = source.request('/novel/1/2.html', { browser: true });
+  const duplicate = source.request('/novel/1/2.html', { browser: true });
+  const b = source.request('/comment/php/api.php?action=get_list', { method: 'post', data: 'cmtid=2' });
+  await Promise.resolve();
+  assert.equal(times.length, 1);
+  release();
+  assert.deepEqual(await Promise.all([a, duplicate, b]), ['/novel/1/2.html', '/novel/1/2.html', '/comment/php/api.php?action=get_list']);
+  assert.equal(maximum, 1);
+  assert.equal(times[1] - times[0], 1500);
+});
+
+test('repeated comment refreshes reuse 15-second results without mixing chapters or pages', async () => {
+  const calls = [];
+  const { source, clock } = pacedSource(async (_, options) => { calls.push(options.data); return options.data; });
+  const url = '/comment/php/api.php?action=get_list';
+  await source.request(url, { method: 'post', data: 'cmtid=1&pageIndex=1' });
+  await source.request(url, { method: 'post', data: 'cmtid=1&pageIndex=1' });
+  assert.equal(calls.length, 1);
+  await source.request(url, { method: 'post', data: 'cmtid=2&pageIndex=1' });
+  await source.request(url, { method: 'post', data: 'cmtid=1&pageIndex=2' });
+  assert.equal(calls.length, 3);
+  clock.now += 15001;
+  await source.request(url, { method: 'post', data: 'cmtid=1&pageIndex=1' });
+  assert.equal(calls.length, 4);
+});
+
+test('403 waits then retries only once; persistent refusal cools down without poisoning the queue', async () => {
+  let attempts = 0;
+  const times = [];
+  const { source } = pacedSource(async (url, _, clock) => {
+    times.push(clock.now);
+    if (url === '/blocked') { attempts++; throw new Error('HTTP 403'); }
+    return 'ok';
+  });
+  await assert.rejects(source.request('/blocked'), /30 秒/);
+  assert.equal(attempts, 2);
+  assert.equal(times[1] - times[0], 6000);
+  assert.equal(await source.request('/next'), 'ok');
+  assert.equal(times[2] - times[1], 30000);
+});
+
+test('a transient 403 can recover, other errors are not retried', async () => {
+  let attempts = 0;
+  const { source } = pacedSource(async url => {
+    if (url === '/transient' && ++attempts === 1) throw new Error('HTTP 403');
+    if (url === '/missing') throw new Error('HTTP 404');
+    return 'complete';
+  });
+  assert.equal(await source.request('/transient'), 'complete');
+  assert.equal(attempts, 2);
+  await assert.rejects(source.request('/missing'), /404/);
+});
 
 test('uses a mobile UA and the canonical mobile domain for browser chapter requests', async () => {
   const source = extension();
