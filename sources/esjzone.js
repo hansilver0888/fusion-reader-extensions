@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         ESJ Zone
-// @version      v1.1.1
+// @version      v1.2.0
 // @author       FusionReader
 // @lang         zh-tw
 // @license      MIT
@@ -9,11 +9,14 @@
 // @icon         https://img.kookapp.cn/assets/2023-01/rhv1ugUjQw0dd0ef.png
 // @webSite      https://www.esjzone.cc
 // @nsfw         false
+// @comments     chapter
 // @network      auto
 // ==/MiruExtension==
 
 export default class extends Extension {
   _loginPending = null;
+  _commentPages = new Map();
+  _commentPending = new Map();
 
   headers(referer) {
     return { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
@@ -40,6 +43,7 @@ export default class extends Extension {
       defaultValue: '',
     });
     this.loggedIn = false;
+    this._commentPages.clear();
   }
 
   /// Sign in if credentials are configured. Returns false when the user has
@@ -234,6 +238,8 @@ export default class extends Extension {
 
   async readChapter(url) {
     const html = await this.page(url);
+    // Opening comments after reading can reuse the chapter's embedded thread.
+    this.rememberComments(url, html);
     // Text and illustrations in one pass, keeping document order.
     let content = [];
     const container = await this.querySelector(html, 'div.forum-content');
@@ -278,5 +284,101 @@ export default class extends Extension {
       }
     }
     return result;
+  }
+
+  commentPath(workUrl, chapterUrl) {
+    const path = value => String(value || '').trim()
+      .replace(/^https?:\/\/(?:www\.)?esjzone\.cc(?=\/)/i, '').split(/[?#]/)[0];
+    const work = path(workUrl).match(/^\/detail\/(\d+)\.html$/);
+    const chapter = path(chapterUrl);
+    const match = chapter.match(/^\/forum\/(\d+)\/(\d+)\.html$/);
+    if (!work || (chapter && (!match || match[1] !== work[1]))) {
+      throw new Error('無效的 ESJ 評論地址或章節不屬於此作品。');
+    }
+    return chapter || path(workUrl);
+  }
+
+  rememberComments(url, html) {
+    const path = String(url).replace(/^https?:\/\/(?:www\.)?esjzone\.cc(?=\/)/i, '').split(/[?#]/)[0];
+    if (!/^\/forum\/\d+\/\d+\.html$/.test(path)) return;
+    this._commentPages.delete(path);
+    this._commentPages.set(path, { time: Date.now(), html });
+    while (this._commentPages.size > 6) this._commentPages.delete(this._commentPages.keys().next().value);
+  }
+
+  async commentThread(path, page) {
+    const cached = this._commentPages.get(path);
+    const age = cached ? Date.now() - cached.time : Infinity;
+    // Refreshes settle for 15 seconds; later pages keep a single thread snapshot.
+    if (cached?.rows && age < (page === 1 ? 15000 : 120000)) return cached;
+    if (this._commentPending.has(path)) return this._commentPending.get(path);
+    const task = (async () => {
+      const html = cached?.html && age < 15000 ? cached.html : await this.page(path);
+      const heading = await this.querySelector(html, '#reply');
+      if (!(await heading.content)) {
+        throw new Error(this.loggedIn ? 'ESJ 未返回評論區，請稍後重試。' : '此章評論可能需要登入，請先填寫 ESJ 帳號和密碼。');
+      }
+      // The website includes all 15-comment sections in the same HTML document.
+      const nodes = await this.querySelectorAll(html, '.comments-section .comment');
+      const rows = [], seen = new Set();
+      for (const node of nodes) {
+        const id = await node.getAttributeText('id');
+        if (!/^comment-\d+$/.test(id || '') || seen.has(id)) continue;
+        seen.add(id);
+        rows.push({ id: id.slice(8), html: await node.content });
+      }
+      const result = { time: Date.now(), rows, parsed: new Map() };
+      this._commentPages.delete(path);
+      this._commentPages.set(path, result);
+      while (this._commentPages.size > 6) this._commentPages.delete(this._commentPages.keys().next().value);
+      return result;
+    })();
+    this._commentPending.set(path, task);
+    try { return await task; }
+    finally { this._commentPending.delete(path); }
+  }
+
+  async parseComment(row) {
+    const author = await this.querySelector(row.html, '.comment-header .comment-title');
+    const time = await this.querySelector(row.html, '.comment-header .comment-meta:not(.comment-floor)');
+    const body = await this.querySelector(row.html, '.comment-body');
+    let html = await body.content;
+    if (!html) throw new Error('ESJ 評論格式已改變，請稍後重試。');
+    // Work from the body instead of p.comment-text: some posts contain divs
+    // inside p tags, which browser HTML parsers move outside the paragraph.
+    for (const selector of ['.comment-header', '.comment-footer', '.show-more']) {
+      const elements = await this.querySelectorAll(html, selector);
+      for (const element of elements) html = html.replace(await element.content, '');
+    }
+    html = html.replace(/<(script|style|iframe|object)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, '')
+      .replace(/<img\b[^>]*\b(?:src|data-src|data-original)\s*=\s*["']\s*(?:javascript|vbscript|data):[^>]*>/gi, '')
+      .replace(/<blockquote\b[^>]*>/gi, '<div>引用：</div><blockquote>');
+    const blocks = this.htmlToBlocks(html, this.webSite + '/');
+    return {
+      id: row.id,
+      username: (await author.text).trim() || '匿名讀者',
+      time: (await time.text).trim(),
+      text: blocks.filter(block => typeof block === 'string').join('\n'),
+      images: [...new Set(blocks.filter(block => block?.type === 'image').map(block => this.imageUrl(block.url)).filter(Boolean))],
+      // ESJ shows quoted replies as ordinary posts, not nested reply threads.
+      replyCount: 0,
+    };
+  }
+
+  async comments(workUrl, chapterUrl, page, parentId) {
+    const path = this.commentPath(workUrl, chapterUrl);
+    if (parentId) return { comments: [], total: 0, hasMore: false };
+    page = Number(page ?? 1);
+    if (!Number.isSafeInteger(page) || page < 1) throw new Error('無效的評論頁碼。');
+    const thread = await this.commentThread(path, page);
+    const start = (page - 1) * 15, comments = [];
+    for (const row of thread.rows.slice(start, start + 15)) {
+      if (!thread.parsed.has(row.id)) thread.parsed.set(row.id, this.parseComment(row));
+      const pending = thread.parsed.get(row.id);
+      try { comments.push(await pending); }
+      catch (error) { thread.parsed.delete(row.id); throw error; }
+    }
+    return { comments, total: thread.rows.length, hasMore: start + 15 < thread.rows.length,
+      headers: this.headers(this.webSite + path) };
   }
 }

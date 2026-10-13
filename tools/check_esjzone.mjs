@@ -34,8 +34,22 @@ try {
   for (const episode of detail.episodes[0].urls.slice(0, 2)) {
     const chapter = await source.watch(episode.url);
     assert.ok(chapter.content.length > 0, 'Chapter text is missing');
-    chapters.push({ blocks: chapter.content.length, characters: chapter.content.filter(x => typeof x === 'string').join('').length });
+    const comments = await source.comments('/detail/1719825699.html', episode.url, 1);
+    assert.ok(comments.comments.length > 0, 'Benchmark chapter comments are missing');
+    assert.ok(comments.comments.every(row => row.id && row.username && row.time && (row.text || row.images.length)));
+    chapters.push({ blocks: chapter.content.length, characters: chapter.content.filter(x => typeof x === 'string').join('').length,
+      comments: comments.total });
   }
+  // The detail discussion has multiple embedded pages, exercising pagination
+  // against real HTML without printing its users or comment text.
+  const first = await source.comments('/detail/1719825699.html', '', 1);
+  const second = await source.comments('/detail/1719825699.html', '', 2);
+  assert.equal(first.comments.length, 15);
+  assert.equal(second.comments.length, 15);
+  assert.equal(first.hasMore, true);
+  assert.equal(second.total, first.total);
+  assert.ok(!first.comments.some(a => second.comments.some(b => a.id === b.id)));
+  assert.ok(first.comments.some(row => row.text.includes('引用：')), 'Quoted replies are missing');
   const id = ++context.__callSeq;
   const image = await new Promise((resolve, reject) => {
     context.__pendingCalls[id] = { resolve, reject };
@@ -45,7 +59,8 @@ try {
   assert.ok(image.imageBytes, 'Benchmark cover did not return an image');
   send('done', { result: { ok: true, loggedIn: source.loggedIn, latest: latest.length, latestWithCovers: latest.filter(x => x.cover).length,
     searchBenchmark: true, searchCover: true, detailCover: true, coverImageReadable: true,
-    chapters: detail.episodes[0].urls.length, chapterSamples: chapters } });
+    chapters: detail.episodes[0].urls.length, chapterSamples: chapters,
+    commentPagination: true, quotedReplies: true, discussionTotal: first.total } });
 } catch (error) {
   send('done', { result: { ok: false, error: error.message } });
   process.exitCode = 1;
