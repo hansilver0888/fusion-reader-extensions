@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         ESJ Zone
-// @version      v1.1.0
+// @version      v1.1.1
 // @author       FusionReader
 // @lang         zh-tw
 // @license      MIT
@@ -13,12 +13,23 @@
 // ==/MiruExtension==
 
 export default class extends Extension {
+  _loginPending = null;
+
+  headers(referer) {
+    return { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
+      Referer: referer || this.webSite + '/' };
+  }
+
+  hasMember(html) {
+    return typeof html === 'string' && /class=["'][^"']*\buser-name\b[^"']*["'][^>]*>\s*[^<\s]/i.test(html);
+  }
+
   async load() {
     await this.registerSetting({
       title: 'ESJ 帳號 (Email)',
       key: 'email',
       type: 'input',
-      description: '部分作品需登入後才能閱讀；留空則以訪客身分瀏覽',
+      description: '翻譯小說需登入才能顯示和閱讀；留空則以訪客身分瀏覽原創作品',
       defaultValue: '',
     });
     await this.registerSetting({
@@ -35,31 +46,77 @@ export default class extends Extension {
   /// not supplied any, so callers can fall back to guest browsing.
   async ensureLogin(force) {
     if (this.loggedIn && !force) return true;
+    if (this._loginPending) return this._loginPending;
     const email = await this.getSetting('email');
     const password = await this.getSetting('password');
-    if (!email || !password) return false;
-
-    const res = await this.request('/inc/mem_login.php', {
-      method: 'post',
-      headers: {
-        'X-Requested-With': 'XMLHttpRequest',
-        Referer: `${this.webSite}/my/login`,
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      data: `email=${encodeURIComponent(email)}&pwd=${encodeURIComponent(
-        password
-      )}&remember_me=on`,
-      allowErrorStatus: true,
-    });
-    const body = typeof res === 'string' ? JSON.parse(res) : res;
-    // 200/301 carry the post-login redirect; 202/203 are validation and
-    // credential failures respectively.
-    if (body.status === 200 || body.status === 301) {
+    if (!email && !password) { this.loggedIn = false; return false; }
+    if (!email || !password) throw new Error('請同時填寫 ESJ 帳號和密碼。');
+    if (this.loggedIn && !force) return true;
+    // Settings cross an async bridge; another caller may have started meanwhile.
+    if (this._loginPending) return this._loginPending;
+    this.loggedIn = false;
+    const task = (async () => {
+      const loginPath = '/my/login', referer = this.webSite + loginPath;
+      const headers = { ...this.headers(referer), 'X-Requested-With': 'XMLHttpRequest',
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' };
+      await this.request(loginPath, { headers: this.headers(referer), retry: false });
+      // Mirror the site's JinJing callback without executing downloaded scripts.
+      const auth = await this.request(loginPath, { method: 'post', headers,
+        data: 'plxf=getAuthToken', retry: false });
+      const tokens = typeof auth === 'string' ? Array.from(auth.matchAll(/<JinJing>([^<>\r\n]+)<\/JinJing>/g)) : [];
+      const token = tokens.length ? tokens[tokens.length - 1][1].trim() : '';
+      if (!/^[A-Za-z0-9+/=_.-]{8,2048}$/.test(token)) throw new Error('ESJ 登入驗證資料未返回，請稍後重試。');
+      const res = await this.request('/inc/mem_login.php', { method: 'post',
+        headers: { ...headers, authorization: token },
+        data: `email=${encodeURIComponent(email)}&pwd=${encodeURIComponent(password)}&remember_me=on`,
+        allowErrorStatus: true, retry: false });
+      let body;
+      try { body = typeof res === 'string' ? JSON.parse(res) : res; }
+      catch (_) { throw new Error('ESJ 登入未返回有效資料，請稍後重試。'); }
+      // 301 is a failed/expired authorization response, not a successful login.
+      if (Number(body?.status) !== 200) {
+        const message = String(body?.msg || '請檢查帳號、密碼或站點狀態').replaceAll(email, '[帳號]').replaceAll(password, '***');
+        throw new Error('ESJ 登入失敗：' + message.slice(0, 180));
+      }
+      const profile = await this.request('/my/profile.html', { headers: this.headers(referer), retry: false });
+      if (!this.hasMember(profile)) throw new Error('ESJ 登入已回應成功，但登入 Cookie 未生效，請重試。');
       this.loggedIn = true;
       return true;
+    })();
+    this._loginPending = task;
+    try { return await task; }
+    finally { this._loginPending = null; }
+  }
+
+  async page(url) {
+    await this.ensureLogin(false);
+    let html = await this.request(url, { headers: this.headers() });
+    if (this.loggedIn && !this.hasMember(html)) {
+      await this.ensureLogin(true);
+      html = await this.request(url, { headers: this.headers() });
+      if (!this.hasMember(html)) throw new Error('ESJ 登入狀態未保留，請稍後重試。');
     }
-    this.loggedIn = false;
-    throw new Error(`ESJ 登入失敗: ${body.msg || `status ${body.status}`}`);
+    if (typeof html !== 'string' || /<title>\s*(?:Just a moment|Attention Required)/i.test(html)) {
+      throw new Error('ESJ 網頁未正常載入，請檢查網路後重試。');
+    }
+    return html;
+  }
+
+  imageUrl(value) {
+    if (!value || /^\s*(?:data|javascript):/i.test(value)) return '';
+    const url = this.absoluteUrl(this.webSite + '/', this.decodeEntities(String(value).trim()));
+    return /^https?:\/\/[^\s/@?#]+(?:[/?#][^\s]*)?$/i.test(url) ? url : '';
+  }
+
+  async cover(html, detail = false) {
+    const selectors = detail ? ['.product-gallery img', '.product-gallery [data-src]'] : ['.main-img [data-src]', '.main-img img', '.card-img-tiles img'];
+    for (const selector of selectors) {
+      for (const attribute of ['data-src', 'data-original', 'src']) {
+        const url = this.imageUrl(await this.getAttributeText(html, selector, attribute));
+        if (url && !/\/(?:loading|nophoto|noimage)\.(?:gif|png)(?:[?#]|$)/i.test(url)) return url;
+      }
+    }
+    return '';
   }
 
   // Cards on list and tag pages share the same markup.
@@ -75,8 +132,8 @@ export default class extends Extension {
       const title = titleEl ? (await titleEl.text).trim() : '';
       if (!title) continue;
       seen.add(href);
-      // Covers are injected client-side, so list pages carry no usable image.
-      out.push({ title, url: href, cover: '' });
+      const update = await this.querySelector(content, '.card-ep a');
+      out.push({ title, url: href, cover: await this.cover(content), update: (await update.text).trim() });
     }
     return out;
   }
@@ -88,6 +145,9 @@ export default class extends Extension {
   async channels() {
     return [
       { title: '最新更新', key: '' },
+      { title: '翻譯・日輕', key: 'japanese' },
+      { title: '翻譯・韓輕', key: 'korean' },
+      { title: '原創', key: 'original' },
       // Doubles as a login probe: it works only with a live session cookie.
       { title: '我的收藏', key: 'favorites' },
     ];
@@ -95,7 +155,11 @@ export default class extends Extension {
 
   async latest(page, channel) {
     if (channel === 'favorites') return this.favorites(page);
-    const html = await this.request(this.pagePath('/list-1', page));
+    const categories = { japanese: '/list-11', korean: '/list-31', original: '/list-21' };
+    if ((channel === 'japanese' || channel === 'korean') && !await this.ensureLogin(false)) {
+      throw new Error('翻譯小說需要登入。請在 ESJ 設定中填寫帳號和密碼。');
+    }
+    const html = await this.page(this.pagePath(categories[channel] || '/list-1', page));
     return this.parseCards(html);
   }
 
@@ -105,9 +169,7 @@ export default class extends Extension {
       throw new Error('「我的收藏」需要登入。請在「扩展」頁點本源的設定按鈕填入 ESJ 帳號密碼。');
     }
     await this.ensureLogin(page <= 1); // page 1 re-authenticates; later pages reuse the session
-    const html = await this.request(this.pagePath('/my/favorite', page), {
-      allowErrorStatus: true,
-    });
+    const html = await this.page(this.pagePath('/my/favorite', page));
     // The member area bounces guests via a script redirect, not a 302. If we
     // still land there after ensureLogin() reported success, the login cookie
     // was not kept — which is exactly what this channel exists to expose.
@@ -134,26 +196,19 @@ export default class extends Extension {
 
   async search(kw, page) {
     // The site has no plain search endpoint; its tag browser doubles as one.
-    const html = await this.request(
+    const html = await this.page(
       this.pagePath(`/tags/${encodeURIComponent(kw)}`, page)
     );
     return this.parseCards(html);
   }
 
   async detail(url) {
-    await this.ensureLogin(false).catch(() => false);
-    let html = await this.request(url);
-    let links = await this.querySelectorAll(html, '#chapterList a');
-    if (!links.length) {
-      // Member-only titles hide their chapter list from guests.
-      if (await this.ensureLogin(true).catch(() => false)) {
-        html = await this.request(url);
-        links = await this.querySelectorAll(html, '#chapterList a');
-      }
-    }
+    const html = await this.page(url);
+    const links = await this.querySelectorAll(html, '#chapterList a');
 
     const titleEl = await this.querySelector(html, 'h2.p-t-10');
     const title = titleEl ? (await titleEl.text).trim() : '';
+    if (!title) throw new Error(this.loggedIn ? 'ESJ 未返回作品详情，請確認作品是否仍存在。' : '此作品可能需要登入，請在 ESJ 設定中填寫帳號和密碼。');
 
     let desc = '';
     const descEl = await this.querySelector(html, 'div.description');
@@ -170,7 +225,7 @@ export default class extends Extension {
 
     return {
       title,
-      cover: '',
+      cover: await this.cover(html, true),
       desc,
       authors: await this.authorsFromMetadata(html),
       episodes: [{ title: '章節', urls: chapters }],
@@ -178,7 +233,7 @@ export default class extends Extension {
   }
 
   async readChapter(url) {
-    const html = await this.request(url);
+    const html = await this.page(url);
     // Text and illustrations in one pass, keeping document order.
     let content = [];
     const container = await this.querySelector(html, 'div.forum-content');
@@ -202,7 +257,6 @@ export default class extends Extension {
   }
 
   async watch(url) {
-    await this.ensureLogin(false).catch(() => false);
     let result = await this.readChapter(url);
 
     if (!result.content.length) {
