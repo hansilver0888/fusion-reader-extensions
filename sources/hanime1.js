@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         Hanime1 動畫
-// @version      v1.0.1
+// @version      v1.1.0
 // @author       FusionReader
 // @lang         zh-tw
 // @license      MIT
@@ -10,6 +10,7 @@
 // @webSite      http://hanime1.me
 // @nsfw         true
 // @network      proxy
+// @comments     work
 // ==/MiruExtension==
 //
 // Transport note (checked 2026-10-14): the site's Cloudflare edge answers
@@ -544,6 +545,100 @@ export default class extends Extension {
     return sources
       .slice()
       .sort((a, b) => b.size - a.size || (a.type === 'mp4' ? 0 : 1) - (b.type === 'mp4' ? 0 : 1))[0];
+  }
+
+  // ---------- comments ----------
+
+  // The video page loads its comments from a small read-only endpoint that
+  // answers `{comments: "<html>"}`; replies come from `{replies: "<html>"}`
+  // keyed by the parent comment. Neither is paginated — the site returns every
+  // comment for a video at once — so a page beyond the first is empty rather
+  // than a duplicate.
+  async comments(workUrl, chapterUrl, page, parentId) {
+    this.state();
+    const videoId = this.videoId(chapterUrl || workUrl);
+    const parent = (parentId === undefined || parentId === null ? '' : String(parentId)).trim();
+    if (parent) {
+      if (!/^\d+$/.test(parent)) throw new Error('無效的評論編號：' + parentId);
+      const html = await this.commentHtml(`/loadReplies?id=${parent}`, 'replies');
+      return { comments: this.commentItems(html), hasMore: false };
+    }
+    const pageNo = parseInt(page, 10);
+    if (pageNo > 1) return { comments: [], hasMore: false };
+    const html = await this.commentHtml(`/loadComment?id=${videoId}&type=video&content=comment-tabcontent`, 'comments');
+    return { comments: this.commentItems(html), hasMore: false };
+  }
+
+  async commentHtml(path, key) {
+    const text = await this.page(path);
+    let payload;
+    try {
+      payload = JSON.parse(text);
+    } catch (error) {
+      throw new Error('網站回傳的評論內容不是有效的 JSON，可能已改版或需要驗證');
+    }
+    const html = payload && typeof payload[key] === 'string' ? payload[key] : '';
+    if (!html) throw new Error('網站沒有回傳評論內容，可能已改版或需要驗證');
+    return html;
+  }
+
+  // Every comment and reply starts with the same report wrapper; the block that
+  // follows carries the avatar, author, time, text, like count and reply count.
+  commentBlocks(html) {
+    const source = String(html || '');
+    const starts = [];
+    let match;
+    const marker = /<div[^>]*class="[^"]*report-btn-wrapper[^"]*"[^>]*>/gi;
+    while ((match = marker.exec(source)) !== null) starts.push(match.index);
+    if (!starts.length) {
+      // Older layouts only expose the report anchor.
+      const alt = /data-reportable-id="\d+"\s+data-reportable-type="comment"/gi;
+      while ((match = alt.exec(source)) !== null) starts.push(match.index);
+    }
+    const blocks = [];
+    for (let i = 0; i < starts.length; i++) {
+      const end = i + 1 < starts.length ? starts[i + 1] : Math.min(source.length, starts[i] + 12000);
+      blocks.push(source.slice(starts[i], end));
+    }
+    return blocks;
+  }
+
+  commentItems(html) {
+    const items = [];
+    const seen = new Set();
+    for (const block of this.commentBlocks(html)) {
+      const id = (block.match(/data-reportable-id="(\d+)"/) || [])[1] || '';
+      if (!id || seen.has(id)) continue;
+
+      const author = block.match(/comment-index-text"[^>]*>\s*<a[^>]*>([\s\S]{0,120}?)<span[^>]*>([^<]{0,40})<\/span>/i);
+      const username = this.textOf(author ? author[1] : '').replace(/\u00a0/g, ' ').trim();
+      const time = this.textOf(author ? author[2] : '').trim();
+
+      const body = block.match(/comment-index-text"[^>]*color:\s*white[^>]*>([\s\S]*?)<\/div>/i);
+      const text = this.textOf(body ? body[1] : '');
+      const images = [];
+      const tags = body ? (body[1].match(/<img\b[^>]*>/gi) || []) : [];
+      for (const image of tags) {
+        const url = this.absolute(this.attrValue(image, 'data-src') || this.attrValue(image, 'src'));
+        // Loading spinners are part of the reply widget, not of the comment.
+        if (url && !/\/image\/icon\//i.test(url) && images.indexOf(url) < 0) images.push(url);
+      }
+
+      const likes = parseInt((block.match(/thumb_up<\/span>\s*<span[^>]*>(\d+)<\/span>/) || [])[1], 10);
+      const replyCount = parseInt((block.match(/(\d+)\s*則回覆/) || [])[1], 10);
+
+      seen.add(id);
+      items.push({
+        id,
+        username: username || '匿名用戶',
+        text,
+        time,
+        likes: likes > 0 ? likes : 0,
+        replyCount: replyCount > 0 ? replyCount : 0,
+        images,
+      });
+    }
+    return items;
   }
 
   // ---------- network ----------

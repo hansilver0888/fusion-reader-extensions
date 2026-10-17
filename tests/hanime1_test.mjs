@@ -376,6 +376,93 @@ test('watch keeps HLS playlists, ignores media on other hosts and reports empty 
   await assert.rejects(members.watch('/watch?v=100005'), /需要網站帳號/);
 });
 
+// The comment widgets below repeat the structure the video page ships: a report
+// wrapper, an author/time line, the body, the report anchor carrying the id, the
+// like count and the reply button.
+const commentBlock = ({ id, user, time, text, likes = 0, replies = 0, images = [] }) => `
+<div class="report-btn-wrapper" style="position: relative;">
+  <div class="comment-index-text" style="font-size: 0.9em;"><a style="text-decoration: none; color: #fff;">${user}&nbsp;&nbsp;<span style="color: darkgray; font-weight: 400; font-size: 0.85em;">${time}</span></a></div>
+  <div class="comment-index-text" style="color: white; font-size: 1em; margin-top: 3px; font-weight: 400; word-wrap: break-word;">${text}${images.map((src) => `<img src="${src}">`).join('')}</div>
+  <span class="material-icons-outlined report-btn no-select" data-toggle="modal" data-reportable-id="${id}" data-reportable-type="comment">more_vert</span>
+</div>
+<div id="comment-like-form-wrapper" style="margin-top: 11px;">
+  <div style="display: inline-block;"><span class="material-icons-outlined">thumb_up</span> <span style="font-size: 0.90em;">${likes}</span></div>
+  <span style="color: darkgray;">回覆</span>
+  ${replies ? `<div class="load-replies-btn no-select" data-commentid="${id}"><span class="reply-btn-text">查看</span> ${replies} 則回覆</div>` : ''}
+  <div id="reply-section-wrapper-${id}" class="reply-section-wrapper"></div>
+</div>`;
+
+const commentPayload = (blocks) => JSON.stringify({ comments: `<div id="comment-section-wrapper">${blocks.join('')}</div>` });
+
+test('comments read the site endpoints, bind the video and stop after the first page', async () => {
+  const source = extension();
+  const listing = commentPayload([
+    commentBlock({ id: '594597', user: '示例讀者', time: '2小時前', text: '第一條評論 &amp; 補充', likes: 6, replies: 3 }),
+    commentBlock({ id: '594638', user: '第二位', time: '50分鐘前', text: '第二條' }),
+  ]);
+  const replies = JSON.stringify({ replies: commentBlock({ id: '594700', user: '回覆者', time: '1小時前', text: '回覆內容' }), comment_id: 594597 });
+  const requested = pages(source, {
+    '/loadComment?id=100001&type=video&content=comment-tabcontent': listing,
+    '/loadReplies?id=594597': replies,
+  });
+
+  const page = await source.comments('/watch?v=100001', null, 1);
+  assert.equal(page.comments.length, 2);
+  assert.equal(page.hasMore, false);
+  assert.equal(page.comments[0].id, '594597');
+  assert.equal(page.comments[0].text, '第一條評論 & 補充');
+  assert.equal(page.comments[0].likes, 6);
+  assert.equal(page.comments[0].replyCount, 3);
+  assert.equal(page.comments[1].username, '第二位');
+
+  const thread = await source.comments('/watch?v=100001', '/watch?v=100001', 1, '594597');
+  assert.equal(thread.comments.length, 1);
+  assert.equal(thread.comments[0].id, '594700');
+  assert.equal(thread.comments[0].text, '回覆內容');
+
+  // the episode url wins when the app knows which episode is open
+  const fromEpisode = await source.comments('/watch?v=999999', '/watch?v=100001&list=555', 1);
+  assert.equal(fromEpisode.comments.length, 2);
+  assert.deepEqual(requested.slice(0, 2), [U('/loadComment?id=100001&type=video&content=comment-tabcontent'), U('/loadReplies?id=594597')]);
+
+  assert.deepEqual(Array.from(await source.comments('/watch?v=100001', null, 2)), []);
+  await assert.rejects(source.comments('/watch?v=100001', null, 1, 'abc'), /評論編號/);
+});
+
+test('comment parsing keeps ids, entities, likes, reply counts and content images', () => {
+  const source = extension();
+  const html = `<div id="comment-section-wrapper">${[
+    commentBlock({ id: '594597', user: '示例 &amp; 讀者', time: '3天前', text: '含圖<br>第二行', likes: 12, replies: 2, images: [
+      'https://vdownload.hembed.com/image/comment/abc.jpg',
+      'https://vdownload.hembed.com/image/comment/abc.jpg',
+      'https://vdownload.hembed.com/image/icon/loading.gif',
+    ] }),
+    commentBlock({ id: '594597', user: '重複', time: '1天前', text: '重複的評論' }),
+    `<div class="report-btn-wrapper"><span data-reportable-id="594650" data-reportable-type="comment"></span></div>`,
+  ].join('')}</div>`;
+  const items = source.commentItems(html);
+  assert.deepEqual(Array.from(items, (item) => item.id), ['594597', '594650']);
+  assert.equal(items[0].username, '示例 & 讀者');
+  assert.equal(items[0].time, '3天前');
+  assert.equal(items[0].text, '含圖\n第二行');
+  assert.equal(items[0].likes, 12);
+  assert.equal(items[0].replyCount, 2);
+  assert.deepEqual(Array.from(items[0].images), ['https://vdownload.hembed.com/image/comment/abc.jpg']);
+  assert.equal(items[1].username, '匿名用戶');
+  assert.deepEqual(Array.from(source.commentItems('')), []);
+  assert.deepEqual(Array.from(source.commentItems('<div>只有留言表單</div>')), []);
+});
+
+test('a broken comment payload is reported instead of looking like an empty discussion', async () => {
+  const source = extension();
+  pages(source, { '/loadComment?id=100001&type=video&content=comment-tabcontent': '<html>gateway</html>' });
+  await assert.rejects(source.comments('/watch?v=100001', null, 1), /不是有效的 JSON/);
+
+  const empty = extension();
+  pages(empty, { '/loadComment?id=100001&type=video&content=comment-tabcontent': JSON.stringify({ content: 'comment-tabcontent' }) });
+  await assert.rejects(empty.comments('/watch?v=100001', null, 1), /沒有回傳評論/);
+});
+
 test('a Cloudflare challenge is reported instead of being parsed as an empty catalogue', async () => {
   const source = extension();
   source.request = async () => '<html><head><title>Just a moment...</title></head><body>Cloudflare</body></html>';

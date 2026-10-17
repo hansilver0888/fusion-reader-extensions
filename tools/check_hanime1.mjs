@@ -115,6 +115,23 @@ assert.ok(media.bytes > 0, 'media sample must return bytes');
 quality = '480p';
 const preferred = await source.watch(episode.url);
 assert.ok(preferred.url.includes('480p'), 'the preferred quality must be picked when available');
+
+// work comments: one read returns the whole discussion, replies need the parent
+const comments = await source.comments(newest.url, episode.url, 1);
+assert.equal(comments.hasMore, false, 'the comment endpoint is not paginated');
+assert.ok(Array.isArray(comments.comments), 'comments must be a list');
+let repliesInThread = 0;
+let withReplies = null;
+for (const comment of comments.comments) {
+  assert.ok(comment.id, 'every comment carries the site id');
+  assert.ok(comment.username, 'every comment carries an author');
+  if (comment.replyCount > 0 && withReplies === null) withReplies = comment;
+}
+if (withReplies) {
+  const thread = await source.comments(newest.url, episode.url, 1, withReplies.id);
+  assert.equal(thread.hasMore, false);
+  repliesInThread = thread.comments.length;
+}
 quality = 'auto';
 
 console.log(JSON.stringify({
@@ -131,5 +148,12 @@ console.log(JSON.stringify({
   newest: { title: detail.title, episodes: detail.episodes[0].urls.length, authors: detail.authors.length },
   playlistWork: { title: series.title, episodes: series.episodes[0].urls.length },
   stream: { type: auto.type, host: auto.url.split('/')[2], sampleBytes: media.bytes, preferred: preferred.url.includes('480p') },
+  comments: {
+    items: comments.comments.length,
+    firstAuthor: comments.comments.length ? comments.comments[0].username : '',
+    firstLikes: comments.comments.length ? comments.comments[0].likes : 0,
+    replyThreadFor: withReplies ? withReplies.id : '',
+    replies: repliesInThread,
+  },
   hosts: Array.from(requests),
 }, null, 2));
