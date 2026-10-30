@@ -12,12 +12,17 @@ vm.runInContext(fs.readFileSync(new URL('../fixtures/runtime.js', import.meta.ur
 vm.runInContext(fs.readFileSync(new URL('../sources/fourkhd.js', import.meta.url), 'utf8')
   .replace('export default class', 'globalThis.Source = class'), context);
 const source = vm.runInContext('new Source()', context);
-source.webSite = 'https://usti.uuss.uk';
+source.webSite = 'https://vxhh.uuss.uk';
+// The plugin resolves the current mirror itself; let it (no pinned entry).
+source.getSetting = async () => '';
+source.setSetting = async () => {};
 
+const mirrorHosts = /^(?:[a-z0-9-]+\.)*(?:uuss\.uk|ssuu\.uk|4khd\.com)$/i;
 let requests = 0;
 source.request = async (url) => {
   requests++;
-  assert.ok(String(url).startsWith('https://usti.uuss.uk/'), `not the declared entry point: ${url}`);
+  const host = (String(url).match(/^https?:\/\/([^/?#]+)/i) || [])[1] || '';
+  assert.ok(mirrorHosts.test(host), `not a known mirror: ${url}`);
   const response = await fetch(url, {
     headers: { 'User-Agent': UA, 'Accept-Language': 'zh-TW,zh;q=0.9', Accept: '*/*' },
     signal: AbortSignal.timeout(40000),
@@ -25,6 +30,9 @@ source.request = async (url) => {
   assert.ok(response.status < 400, `${url} answered ${response.status}`);
   return response.text();
 };
+
+const entry = await source.entry();
+assert.ok(mirrorHosts.test(entry.replace(/^https?:\/\//, '')), `resolved entry looks wrong: ${entry}`);
 
 async function imageSample(url) {
   const response = await fetch(url, {
@@ -86,6 +94,7 @@ assert.notEqual(partReading.urls[0], reading.urls[0], 'parts must not share the 
 
 console.log(JSON.stringify({
   ok: true,
+  entry,
   channels: channels.length,
   firstPage: first.length,
   secondPage: second.length,

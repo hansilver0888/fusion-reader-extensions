@@ -15,12 +15,14 @@ function extension(clock) {
   vm.runInContext(fs.readFileSync(new URL('../sources/fourkhd.js', import.meta.url), 'utf8')
     .replace('export default class', 'globalThis.Source = class'), context);
   const source = vm.runInContext('new Source()', context);
-  source.webSite = 'https://usti.uuss.uk';
+  source.webSite = 'https://vxhh.uuss.uk';
+  // Most cases exercise parsing, not mirror discovery: pin the resolved entry.
+  source._site = 'https://vxhh.uuss.uk';
   source.sleep = async (ms) => { if (clock) clock.now += ms; };
   return source;
 }
 
-const ENTRY = 'https://usti.uuss.uk';
+const ENTRY = 'https://vxhh.uuss.uk';
 
 function U(path) {
   return ENTRY + path;
@@ -285,4 +287,97 @@ test('a changed listing page is reported instead of being read as an empty catal
   const brokenJson = extension();
   routes(brokenJson, { '/wp-json/wp/v2/posts?slug=sample-work': '<html>gateway</html>' });
   await assert.rejects(brokenJson.detail('/content/05/sample-work.html'), /不是有效的 JSON|找不到這部作品|無法解析/);
+});
+
+test('mirror addresses are normalised and only the known families are accepted', () => {
+  const source = extension();
+  assert.equal(source.normalizeEntry('https://vxhh.uuss.uk'), 'https://vxhh.uuss.uk');
+  assert.equal(source.normalizeEntry('vxhh.uuss.uk'), 'https://vxhh.uuss.uk');
+  assert.equal(source.normalizeEntry('http://hfjsg.ssuu.uk/'), 'https://hfjsg.ssuu.uk');
+  assert.equal(source.normalizeEntry('https://www.4khd.com'), 'https://www.4khd.com');
+  assert.equal(source.normalizeEntry('https://evil.example.com'), '');
+  assert.equal(source.normalizeEntry('https://vxhh.uuss.uk/pages/album'), '');
+  assert.equal(source.normalizeEntry('   '), '');
+});
+
+test('a moved host prints its candidate list, which the resolver follows', async () => {
+  const source = extension();
+  const landing = '<!DOCTYPE html><html><head><script>(function(){'
+    + "const sites = [ 'https://vxhh.uuss.uk', 'https://hfjsg.ssuu.uk' ];"
+    + '})();</script></head><body></body></html>';
+  assert.deepEqual(Array.from(source.landingCandidates(landing)), ['https://vxhh.uuss.uk', 'https://hfjsg.ssuu.uk']);
+  assert.deepEqual(Array.from(source.landingCandidates('<html>nothing here</html>')), []);
+
+  const moved = extension();
+  moved._site = '';
+  const requested = [];
+  moved.request = async (url) => {
+    requested.push(url);
+    if (url === 'https://vxhh.uuss.uk/wp-json/wp/v2/categories?per_page=1') {
+      return landing.replace(/https:\/\/vxhh[^']+/g, '');
+    }
+    if (url === 'https://usti.uuss.uk/wp-json/wp/v2/categories?per_page=1') return landing;
+    if (url === 'https://hfjsg.ssuu.uk/wp-json/wp/v2/categories?per_page=1') return '[{"id":9}]';
+    throw new Error('unexpected ' + url);
+  };
+  const saved = [];
+  moved.getSetting = async () => '';
+  moved.setSetting = async (key, value) => { saved.push([key, value]); };
+  assert.equal(await moved.resolveEntry(), 'https://hfjsg.ssuu.uk');
+  assert.deepEqual(saved, [['entry', 'https://hfjsg.ssuu.uk']]);
+  assert.ok(requested.includes('https://hfjsg.ssuu.uk/wp-json/wp/v2/categories?per_page=1'));
+});
+
+test('a stored entry wins, and a dead one falls through to the known mirrors', async () => {
+  const stored = extension();
+  stored._site = '';
+  const storedRequests = [];
+  stored.request = async (url) => {
+    storedRequests.push(url);
+    if (url.startsWith('https://custom.uuss.uk/')) return '[{"id":1}]';
+    throw new Error('HTTP 502');
+  };
+  stored.getSetting = async () => 'custom.uuss.uk';
+  stored.setSetting = async () => {};
+  assert.equal(await stored.resolveEntry(), 'https://custom.uuss.uk');
+  assert.deepEqual(storedRequests, ['https://custom.uuss.uk/wp-json/wp/v2/categories?per_page=1']);
+
+  const dead = extension();
+  dead._site = '';
+  dead.request = async () => { throw new Error('HTTP 502'); };
+  dead.getSetting = async () => '';
+  dead.setSetting = async () => {};
+  await assert.rejects(dead.resolveEntry(), /沒有可用的鏡像站點/);
+});
+
+test('a host that starts answering with its landing page is replaced mid session', async () => {
+  const source = extension();
+  source._site = 'https://vxhh.uuss.uk';
+  const requested = [];
+  source.request = async (url) => {
+    requested.push(url);
+    if (url === 'https://vxhh.uuss.uk/pages/album') return '<script>const sites = ["https://hfjsg.ssuu.uk"];</script>';
+    if (url === 'https://hfjsg.ssuu.uk/wp-json/wp/v2/categories?per_page=1') return '[{"id":3}]';
+    if (url === 'https://hfjsg.ssuu.uk/pages/album') return listing([card({ id: '73597', slug: 'sample-a', title: '示例作品 A' })]);
+    throw new Error('unexpected ' + url);
+  };
+  source.getSetting = async () => '';
+  source.setSetting = async () => {};
+  const items = await source.latest(1, '');
+  assert.equal(items.length, 1);
+  assert.equal(source._site, 'https://hfjsg.ssuu.uk');
+  assert.ok(requested.includes('https://hfjsg.ssuu.uk/pages/album'));
+});
+
+test('work links from the api are rewritten onto the resolved mirror', async () => {
+  const source = extension();
+  source._site = 'https://hfjsg.ssuu.uk';
+  source.getSetting = async () => '';
+  source.setSetting = async () => {};
+  const items = source.items([
+    { id: 1, link: 'https://www.4khd.com/content/05/sample-work.html', title: { rendered: '示例' }, jetpack_featured_media_url: 'https://i0.wp.com/pic.4khd.com/x.webp' },
+  ]);
+  assert.equal(items[0].url, '/content/05/sample-work.html');
+  assert.equal(source.siteUrl('https://www.4khd.com/content/05/sample-work.html'), 'https://hfjsg.ssuu.uk/content/05/sample-work.html');
+  assert.equal(source.absolute('/pages/album'), 'https://hfjsg.ssuu.uk/pages/album');
 });

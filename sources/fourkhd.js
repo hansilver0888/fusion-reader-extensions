@@ -1,13 +1,13 @@
 // ==MiruExtension==
 // @name         4KHD 圖集
-// @version      v1.0.0
+// @version      v1.1.0
 // @author       FusionReader
 // @lang         all
 // @license      MIT
 // @package      fourkhd
 // @type         manga
-// @icon         https://usti.uuss.uk/wp-content/uploads/2023/02/4khd-1-150x150.png
-// @webSite      https://usti.uuss.uk
+// @icon         https://vxhh.uuss.uk/wp-content/uploads/2023/02/4khd-1-150x150.png
+// @webSite      https://vxhh.uuss.uk
 // @nsfw         true
 // @network      auto
 // ==/MiruExtension==
@@ -25,16 +25,27 @@
 // `/wp-json/...` is rate limited by nginx and rejects the `_fields` parameter
 // with 403, so listings stay on the html pages and the api is only asked for
 // single works. Links printed by the pages point at the canonical host; they
-// are moved back to the entry point above so browsing works even when the
+// are moved back to the resolved entry point so browsing works even when the
 // canonical host is unreachable.
+//
+// Mirror hosts rotate (usti.uuss.uk -> vxhh.uuss.uk, and the old host now
+// answers with a small landing page that probes its own candidate list), so the
+// entry point is resolved at start up: the address in the plugin setting wins,
+// then the known mirrors, then whatever the landing page lists. The first host
+// whose api answers is stored back into the setting, which is what keeps a
+// future rotation working without reinstalling the plugin.
 //
 // Images are served by i0.wp.com (a Jetpack/Photon resizer in front of
 // pic.4khd.com). They answer without a referer, and asking for a larger `w`
 // than the site uses is rate limited with 429, so urls are used exactly as the
 // content prints them.
 
-const SITE = 'https://usti.uuss.uk';
-const ORIGIN_HOSTS = /^(?:www\.|m\.)?4khd\.com$/i;
+// Mirrors rotate their host; only these families are accepted as entry points.
+const DEFAULT_ENTRY = 'https://vxhh.uuss.uk';
+const KNOWN_ENTRIES = ['https://vxhh.uuss.uk', 'https://usti.uuss.uk', 'https://hfjsg.ssuu.uk'];
+const MIRROR_HOSTS = /^(?:[a-z0-9-]+\.)*(?:uuss\.uk|ssuu\.uk|4khd\.com)$/i;
+const CANONICAL_HOSTS = /^(?:www\.|m)?4khd\.com$/i;
+
 
 // Curated listing pages, in the order the app shows them.
 const LISTING_PAGES = [
@@ -72,25 +83,163 @@ export default class extends Extension {
       this._cooldownUntil = 0;
       this._queue = Promise.resolve();
       this._categories = null;
+      this._site = this._site || '';
+      this._entryPending = null;
     }
     return this;
   }
 
   async load() {
     this.state();
+    try {
+      await this.registerSetting({
+        key: 'entry',
+        title: '站點入口',
+        type: 'input',
+        description: '留空自動偵測鏡像；也可手動填寫 https://vxhh.uuss.uk 這類地址。',
+        defaultValue: '',
+      });
+    } catch (error) {
+      // older runtimes without settings still resolve the entry on first read
+    }
+    try {
+      await this.entry();
+    } catch (error) {
+      // the first real read retries and reports the failure with context
+    }
+  }
+
+  // ---------- mirror entry ----------
+
+  // The mirror address is resolved once per session, then remembered in the
+  // plugin setting so the next start uses it directly.
+  async entry() {
+    this.state();
+    if (this._site) return this._site;
+    if (this._entryPending) return this._entryPending;
+    this._entryPending = this.resolveEntry().then(
+      (site) => {
+        this._site = site;
+        this._entryPending = null;
+        return site;
+      },
+      (error) => {
+        this._entryPending = null;
+        throw error;
+      }
+    );
+    return this._entryPending;
+  }
+
+  async resolveEntry() {
+    const seen = new Set();
+    const queue = [];
+    const push = (value) => {
+      const site = this.normalizeEntry(value);
+      if (!site || seen.has(site)) return;
+      seen.add(site);
+      queue.push(site);
+    };
+
+    push(await this.storedEntry());
+    for (const known of KNOWN_ENTRIES) push(known);
+    push(DEFAULT_ENTRY);
+
+    const observed = [];
+    while (queue.length) {
+      const site = queue.shift();
+      const result = await this.probeEntry(site);
+      if (result.ok) {
+        await this.rememberEntry(site);
+        return site;
+      }
+      for (const candidate of result.listed) {
+        if (!this.normalizeEntry(candidate)) continue;
+        observed.push(candidate);
+        push(candidate);
+      }
+    }
+    throw new Error(
+      '沒有可用的鏡像站點。\n'
+      + '站點會不定期更換域名，插件已嘗試已知鏡像與落地頁列出的地址。\n'
+      + '可稍後重試，或在插件設置的「站點入口」裡手動填寫當前鏡像地址。'
+    );
+  }
+
+  // A mirror is considered usable when its own api answers with JSON; anything
+  // else (a "site moved" landing page, a block page) is treated as moved.
+  async probeEntry(site) {
+    let body = '';
+    try {
+      const response = await this.request(`${site}/wp-json/wp/v2/categories?per_page=1`, {
+        headers: { 'Accept-Language': 'zh-TW,zh;q=0.9', Accept: 'application/json' },
+      });
+      body = typeof response === 'string' ? response : JSON.stringify(response);
+    } catch (error) {
+      return { ok: false, listed: [] };
+    }
+    try {
+      const payload = JSON.parse(body);
+      if (Array.isArray(payload)) return { ok: true, listed: [] };
+    } catch (error) {
+      // fall through: the body may be the landing page
+    }
+    return { ok: false, listed: this.landingCandidates(body) };
+  }
+
+  // The old host answers with a script that probes its own candidate list:
+  //   const sites = [ 'https://vxhh.uuss.uk', 'https://hfjsg.ssuu.uk' ];
+  // Only that list counts — a normal page is full of unrelated urls.
+  landingCandidates(html) {
+    const list = String(html || '').match(/sites\s*=\s*\[([^\]]*)\]/i);
+    if (!list) return [];
+    const found = [];
+    for (const quoted of list[1].match(/['"]([^'"]+)['"]/g) || []) found.push(quoted.replace(/['"]/g, ''));
+    return found;
+  }
+
+  normalizeEntry(value) {
+    const text = (value === undefined || value === null ? '' : String(value)).trim();
+    if (!text) return '';
+    const withScheme = /^https?:\/\//i.test(text) ? text : `https://${text}`;
+    const match = withScheme.match(/^https?:\/\/([^/?#:]+)(?::\d+)?\/?$/i);
+    if (!match) return '';
+    const host = match[1].toLowerCase();
+    if (!MIRROR_HOSTS.test(host)) return '';
+    return `https://${host}`;
+  }
+
+  async storedEntry() {
+    try {
+      return await this.getSetting('entry');
+    } catch (error) {
+      return '';
+    }
+  }
+
+  async rememberEntry(site) {
+    try {
+      await this.setSetting('entry', site);
+    } catch (error) {
+      // read-only settings must not break browsing
+    }
+  }
+
+  currentSite() {
+    return this._site || DEFAULT_ENTRY;
   }
 
   // ---------- url helpers ----------
 
   // Accept the site's own work urls, with or without the part suffix. The
-  // canonical host is accepted too, since the site prints its own links.
+  // canonical host and any mirror are accepted too, since the site prints its
+  // own links.
   postTarget(url) {
     const text = (url === undefined || url === null ? '' : String(url)).trim();
     if (!text) throw new Error('無效的作品地址：' + text);
     if (/^https?:\/\//i.test(text)) {
       const host = (text.match(/^https?:\/\/([^/?#]+)/i) || [])[1] || '';
-      const entry = SITE.replace(/^https?:\/\//i, '');
-      if (!ORIGIN_HOSTS.test(host) && host.toLowerCase() !== entry.toLowerCase()) {
+      if (!CANONICAL_HOSTS.test(host) && !MIRROR_HOSTS.test(host)) {
         throw new Error('無效的作品地址：' + text);
       }
     }
@@ -104,16 +253,17 @@ export default class extends Extension {
   absolute(url) {
     const value = (url || '').trim();
     if (!value) return '';
-    const resolved = /^https?:\/\//i.test(value) ? value : this.absoluteUrl(SITE, value);
+    const resolved = /^https?:\/\//i.test(value) ? value : this.absoluteUrl(this.currentSite(), value);
     return /^https?:\/\//i.test(resolved) ? resolved : '';
   }
 
-  // Site pages print the canonical host; requests go to the entry point.
+  // Site pages print the canonical host; requests go to the resolved mirror.
   siteUrl(url) {
     const resolved = this.absolute(url);
     if (!resolved) return '';
-    return resolved.replace(/^(https?):\/\/(?:www\.|m\.)?4khd\.com/i, SITE);
+    return resolved.replace(/^(https?):\/\/(?:www\.|m)?4khd\.com/i, this.currentSite());
   }
+
 
   pageNumber(page) {
     const raw = page === undefined || page === null ? '' : String(page).trim();
@@ -436,7 +586,7 @@ export default class extends Extension {
     const running = this._inflight.get(path);
     if (running) return running;
 
-    const task = this.fetchPage(path).then(
+    const task = this.fetchPage(path, retried).then(
       (body) => {
         this._pages.set(path, { time: Date.now(), body });
         this._inflight.delete(path);
@@ -469,7 +619,7 @@ export default class extends Extension {
     );
   }
 
-  async fetchPage(path) {
+  async fetchPage(path, retried) {
     const pace = () => {
       const now = Date.now();
       const wait = Math.max(
@@ -483,10 +633,21 @@ export default class extends Extension {
     });
     await this._queue;
 
-    const text = await this.request(SITE + path, {
+    const site = await this.entry();
+    const text = await this.request(site + path, {
       headers: { 'Accept-Language': 'zh-TW,zh;q=0.9', Accept: '*/*' },
     });
-    return typeof text === 'string' ? text : JSON.stringify(text);
+    const body = typeof text === 'string' ? text : JSON.stringify(text);
+
+    // Mid-session rotation: the host answered with its "we moved" landing page
+    // instead of the site. Drop the entry, resolve again and retry once.
+    if (!retried && this.landingCandidates(body).length) {
+      this._site = '';
+      this._pages.clear();
+      await this.entry();
+      return this.fetchPage(path, true);
+    }
+    return body;
   }
 
   // The runtime clamps a single sleep call, so longer pauses are split up.
