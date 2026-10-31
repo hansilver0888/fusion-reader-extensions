@@ -1,6 +1,6 @@
 ﻿// ==MiruExtension==
 // @name         MissAV
-// @version      v1.1.3
+// @version      v1.1.4
 // @author       FusionReader
 // @lang         zh-tw
 // @license      MIT
@@ -389,10 +389,17 @@ export default class extends Extension {
     return value;
   }
 
-  challenged(body) {
+  // Two different Cloudflare answers are worth telling apart: the managed
+  // challenge (needs a session) and a hard block (needs another route).
+  challengeKind(body) {
     const text = String(body || '');
-    if (!/Just a moment|cf-challenge|challenges\.cloudflare\.com/i.test(text)) return false;
-    return !/thumbnail group|\/dm\d+\/[a-z]{2}\//i.test(text);
+    if (/Just a moment|cf-challenge|challenges\.cloudflare\.com/i.test(text)) return 'challenge';
+    if (/Attention Required|cf-error-code|cf-error-details/i.test(text)) return 'block';
+    return '';
+  }
+
+  challenged(body) {
+    return this.challengeKind(body) !== '';
   }
 
   // Work urls are `/<lang>/<code>` and may carry a rotating `/dm<N>` prefix.
@@ -567,6 +574,15 @@ export default class extends Extension {
     return task;
   }
 
+  // cf_clearance embeds its issue time: <hash>-<epoch>-1.2.1.1-<payload>.
+  // Returns the age in milliseconds, or 0 when the value does not carry one.
+  clearanceAge(value) {
+    const match = String(value || '').match(/(?:cf_clearance=)?[A-Za-z0-9_.]+-(\d{10})(?:-|$)/);
+    if (!match) return 0;
+    const age = Date.now() - parseInt(match[1], 10) * 1000;
+    return age > 0 ? age : 0;
+  }
+
   async get(site, path, agentOverride) {
     this.state();
     const pace = () => {
@@ -578,17 +594,28 @@ export default class extends Extension {
     });
     await this._queue;
 
-    const text = await this.request(site + path, { headers: await this.headers(agentOverride) });
+    // The app throws on 4xx unless the source opts in, and the challenge page
+    // *is* a 403: ask for the body so the failure can be explained instead of
+    // bubbling up as a bare status code.
+    const text = await this.request(site + path, {
+      headers: await this.headers(agentOverride),
+      allowErrorStatus: true,
+    });
     const body = typeof text === 'string' ? text : JSON.stringify(text);
     if (this.challenged(body)) {
       const session = await this.session();
       // The next attempt must re-read the settings: the user may have just
       // pasted a fresh clearance.
       this._session = null;
+      const age = this.clearanceAge(session.cookie);
+      const stale = age > 2 * 86400000
+        ? `\n這個 cf_clearance 看起來是 ${Math.round(age / 86400000)} 天前簽發的，多半已經過期。`
+        : '';
+      const kind = this.challengeKind(body) === 'block' ? '攔截頁（Attention Required）' : '驗證頁（Just a moment）';
       throw new Error(
-        'MissAV 回傳 Cloudflare 驗證頁（Just a moment...）。\n'
+        `MissAV 回傳 Cloudflare ${kind}。\n`
         + `本次送出：Cookie ${session.cookie ? `（${session.cookie.length} 字元，${session.cookie.indexOf('cf_clearance=') >= 0 ? '含 cf_clearance' : '缺少 cf_clearance 名稱'}）` : '未設定'}，`
-        + `UA ${session.agent ? `（${session.agent.slice(0, 42)}…）` : '（本體預設）'}。\n`
+        + `UA ${session.agent ? `（${session.agent.slice(0, 42)}…）` : '（本體預設）'}。${stale}\n`
         + '請在瀏覽器打開 missav 通過驗證，把整段 Cookie（含 cf_clearance）與同一個瀏覽器的 UA 填進插件設置；'
         + 'Cookie 過期後需要重新複製。'
       );

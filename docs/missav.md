@@ -1,4 +1,4 @@
-﻿# MissAV v1.1.3
+# MissAV v1.1.4
 
 2026-10-31 用真实会话核对 `missav.ai`，完成单文件插件。只读取公开页面，不登录、不写入、不调用广告或统计接口。
 
@@ -27,6 +27,15 @@
 ### 一个框就能填（v1.1.2）
 
 把浏览器里复制的 `cookie: … ua: …` 整段（或 DevTools「Copy as cURL」整行）粘进「瀏覽器 Cookie」，插件会同时取出 Cookie 与 UA；UA 字段留空也可以。若只有 Cookie、UA 未知，入口探测会用内置候选 UA 依次试（Android Chrome 156 / Android Chrome 131 / Windows Chrome 131），命中后写回设置，下次启动一次请求即可。
+
+### 报错能自证（v1.1.4）
+
+本体对 4xx 默认直接抛异常，插件看不到响应体。现在读取请求带 `allowErrorStatus`，403 的 Cloudflare 页面会进到插件里：报错写明「本次送出」的 Cookie 长度、是否含 `cf_clearance=` 名称、UA 前缀，区分「验证页」与「拦截页（Attention Required）」，并在 `cf_clearance` 内嵌时间超过 2 天时提示「看起來是 N 天前簽發的，多半已經過期」。
+
+```
+cf_clearance 的值里带签发时间：<hash>-<10 位时间戳>-1.2.1.1-<载荷>
+例：ph57…wA-1790348026-1.2.1.1-… → 1790348026 ≈ 2026-09-25（已过期）
+```
 
 ### 保存设置立即生效（v1.1.3）
 

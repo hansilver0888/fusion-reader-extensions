@@ -331,6 +331,47 @@ test('a challenged read drops the snapshot so the next attempt re-reads the sett
   assert.equal((await source.latest(1, 'new')).length, 1);
 });
 
+test('clearance age comes from the epoch embedded in the value', () => {
+  const clock = { now: 1790000000000 };
+  const source = extension(clock);
+  assert.equal(source.clearanceAge('cf_clearance=abc-1790000000-1.2.1.1-payload'), 0);
+  assert.equal(source.clearanceAge('cf_clearance=abc-1790348026-1.2.1.1-payload'), 0);
+  clock.now = 1790348026000 + 5 * 86400000;
+  assert.equal(source.clearanceAge('cf_clearance=abc-1790348026-1.2.1.1-payload'), 5 * 86400000);
+  const old = extension({ now: 1790348026000 + 40 * 86400000 });
+  assert.equal(old.clearanceAge('cf_clearance=abc-1790348026-1.2.1.1-payload'), 40 * 86400000);
+  assert.equal(old.clearanceAge('cf_clearance=no-timestamp'), 0);
+  assert.equal(old.clearanceAge(''), 0);
+});
+
+test('a challenge error reports what was sent, the page kind and a stale clearance', async () => {
+  const clock = { now: 1790348026000 + 40 * 86400000 };
+  const source = extension(clock);
+  source.getSetting = async (key) => ({
+    cookie: 'cf_clearance=abc-1790348026-1.2.1.1-payload',
+    user_agent: 'Mozilla/5.0 (Linux; Android 16) Chrome/156 Mobile',
+  }[key] || '');
+  const seen = [];
+  source.request = async (url, options) => {
+    seen.push(options);
+    return challengePage;
+  };
+  await assert.rejects(source.latest(1, 'new'), (error) => {
+    assert.match(error.message, /Cloudflare 驗證頁/);
+    assert.match(error.message, /本次送出：Cookie\s+（\d+ 字元，含 cf_clearance）/);
+    assert.match(error.message, /UA\s+（Mozilla\/5\.0 \(Linux; Android 16\)/);
+    assert.match(error.message, /40 天前簽發/);
+    return true;
+  });
+  // the body has to reach the plugin, so the app must not throw on the 403
+  assert.equal(seen[0].allowErrorStatus, true);
+
+  const blocked = extension();
+  blocked.getSetting = async () => '';
+  blocked.request = async () => '<html><body><h1>Attention Required! | Cloudflare</h1><div id="cf-error-details"></div></body></html>';
+  await assert.rejects(blocked.latest(1, 'new'), /攔截頁（Attention Required）/);
+});
+
 test('load registers the five settings even without a settings ui', async () => {
   const source = extension();
   const registered = [];
