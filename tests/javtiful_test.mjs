@@ -124,24 +124,16 @@ test('covers skip the lazy placeholder and use the real image', () => {
   assert.equal(source.imageUrl('<img src="/assets/front/media/video-thumb-placeholder.svg">'), '');
 });
 
-test('detail uses a portrait cover by default and the still when asked', async () => {
+test('detail uses the real still, never the generic avatar', async () => {
   const source = extension();
   routes(source, { '/ja/video/114372/snos-378': workPage({}) });
   const detail = await source.detail('/ja/video/114372/snos-378');
   assert.equal(detail.title, 'SNOS-378 中年男性が純白のIカップの胸に興奮し');
-  // the app's cover box is 120x170, so the performer portrait is preferred
-  assert.ok(detail.cover.endsWith('5544e2b6b4adee534a771fd4fb845542.jpg'), detail.cover);
+  // the page's "actress" picture is a generic avatar, so it must not be used
+  assert.ok(detail.cover.endsWith('233d4c671d0cc2d93b40644e3dfc4439.jpg'), detail.cover);
+  assert.ok(!detail.cover.includes('/collections/actresses/'), detail.cover);
   assert.ok(detail.desc.includes('SNOS-378'));
   assert.equal(detail.episodes[0].urls[0].url, '/ja/video/114372/snos-378');
-
-  const still = extension();
-  still.getSetting = async (key) => (key === 'cover' ? 'still' : '');
-  routes(still, { '/ja/video/114372/snos-378': workPage({}) });
-  assert.ok((await still.detail('/ja/video/114372/snos-378')).cover.endsWith('233d4c671d0cc2d93b40644e3dfc4439.jpg'));
-
-  const noActress = extension();
-  routes(noActress, { '/ja/video/114372/snos-378': workPage({ actress: '' }) });
-  assert.ok((await noActress.detail('/ja/video/114372/snos-378')).cover.endsWith('233d4c671d0cc2d93b40644e3dfc4439.jpg'));
 });
 
 test('watch trades the ticket for the largest signed mp4', async () => {

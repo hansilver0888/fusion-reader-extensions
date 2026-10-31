@@ -1,6 +1,6 @@
-﻿// ==MiruExtension==
+// ==MiruExtension==
 // @name         Javtiful
-// @version      v1.0.1
+// @version      v1.0.2
 // @author       FusionReader
 // @lang         zh-tw
 // @license      MIT
@@ -49,27 +49,8 @@ export default class extends Extension {
   }
 
   async load() {
+    // the site needs no account or cookie to play
     this.state();
-    try {
-      await this.registerSetting({
-        key: 'cover',
-        title: '封面樣式',
-        type: 'input',
-        description: 'portrait（預設）：詳情用人物豎圖，適合本體 120×170 的封面框；still：詳情用影片劇照（橫圖會被裁掉兩側）。列表封面不受影響。',
-        defaultValue: 'portrait',
-      });
-    } catch (error) {
-      // older runtimes without a settings ui still work with the default
-    }
-  }
-
-  async setting(key) {
-    try {
-      const value = await this.getSetting(key);
-      return value === undefined || value === null ? '' : String(value).trim();
-    } catch (error) {
-      return '';
-    }
   }
 
   // ---------- helpers ----------
@@ -194,14 +175,6 @@ export default class extends Extension {
     return src && !src.includes('video-thumb-placeholder') ? this.absolute(src) : '';
   }
 
-  // The work page carries the performer's portrait next to the video still. The
-  // app's detail cover box is 120x170, so a 16:9 still is cropped to its middle;
-  // the portrait fills the box instead.
-  actressImage(html) {
-    const match = String(html).match(/\/uploads\/uploads\/collections\/actresses\/[^"'\s]+\.(?:jpg|jpeg|png|webp)/i);
-    return match ? this.absolute(match[0]) : '';
-  }
-
   slugTitle(slug) {
     const text = String(slug || '').replace(/-/g, ' ').trim();
     if (!text) return '';
@@ -219,12 +192,11 @@ export default class extends Extension {
         .replace(/\s*\|\s*Javtiful\s*$/i, '').trim()
       || target.slug;
     const poster = this.jsonField(html, 'videoPoster');
-    const still = this.absolute(poster) || this.absolute(this.meta(html, 'og:image'));
-    // Only a portrait image fills the app's 120x170 cover box; the still stays
-    // available through the cover setting.
-    const style = (await this.setting('cover')) || 'portrait';
-    const portrait = this.actressImage(html);
-    const cover = style === 'still' ? still : (portrait || still);
+    // The work page's "actress" picture is the site's generic avatar, not a
+    // portrait, so the real still is the only usable cover.
+    const cover = this.absolute(poster)
+      || this.absolute(this.meta(html, 'og:image'))
+      || this.absolute((html.match(/data-front-lazy-src="([^"]+)"/) || [])[1]);
     const desc = this.textOf(this.meta(html, 'description'));
     return {
       title,
