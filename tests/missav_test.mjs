@@ -141,7 +141,7 @@ test('a challenged host falls through to the next mirror and explains when all f
   dead._site = '';
   dead.getSetting = async () => '';
   dead.request = async () => challengePage;
-  await assert.rejects(dead.resolveEntry(), /沒有可用的 missav 入口|Cloudflare/);
+  await assert.rejects(dead.resolveEntry(), /Cloudflare|沒有可用入口/);
 });
 
 test('a cookie without a user agent retries the candidate agents and stores the one that works', async () => {
@@ -357,10 +357,10 @@ test('a challenge error reports what was sent, the page kind and a stale clearan
     return challengePage;
   };
   await assert.rejects(source.latest(1, 'new'), (error) => {
-    assert.match(error.message, /Cloudflare 驗證頁/);
-    assert.match(error.message, /本次送出：Cookie\s+（\d+ 字元，含 cf_clearance）/);
-    assert.match(error.message, /UA\s+（Mozilla\/5\.0 \(Linux; Android 16\)/);
-    assert.match(error.message, /40 天前簽發/);
+    assert.match(error.message, /Cloudflare 驗證頁 403/);
+    assert.match(error.message, /Cookie \d+ 字元·含 cf_clearance/);
+    assert.match(error.message, /UA \d+ 字元（Mozilla\/5\.0 \(Linux; Andr/);
+    assert.match(error.message, /簽發於 40 天前/);
     return true;
   });
   // the body has to reach the plugin, so the app must not throw on the 403
@@ -369,7 +369,7 @@ test('a challenge error reports what was sent, the page kind and a stale clearan
   const blocked = extension();
   blocked.getSetting = async () => '';
   blocked.request = async () => '<html><body><h1>Attention Required! | Cloudflare</h1><div id="cf-error-details"></div></body></html>';
-  await assert.rejects(blocked.latest(1, 'new'), /攔截頁（Attention Required）/);
+  await assert.rejects(blocked.latest(1, 'new'), /Cloudflare 攔截頁 403/);
 });
 
 test('load registers the five settings even without a settings ui', async () => {

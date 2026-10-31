@@ -1,6 +1,6 @@
 ﻿// ==MiruExtension==
 // @name         MissAV
-// @version      v1.1.4
+// @version      v1.1.5
 // @author       FusionReader
 // @lang         zh-tw
 // @license      MIT
@@ -259,17 +259,61 @@ export default class extends Extension {
     for (const known of KNOWN_ENTRIES) push(known);
 
     const failures = [];
+    let challenged = 0;
     while (queue.length) {
       const site = queue.shift();
       const result = await this.probeEntry(site);
       if (result.ok) return site;
-      failures.push(`${site}（${result.reason}）`);
+      if (result.reason === 'challenge') challenged++;
+      const label = result.reason === 'challenge'
+        ? '403 驗證'
+        : result.reason === 'block'
+          ? '403 攔截'
+          : result.reason === 'page'
+            ? '非預期頁面'
+            : result.reason;
+      failures.push(`${site.replace(/^https?:\/\//, '')} ${label}`);
     }
-    throw new Error(
-      '沒有可用的 missav 入口。\n' + failures.join('\n')
-      + '\n站點由 Cloudflare 挑戰保護：在瀏覽器打開一次 missav 並通過驗證，'
-      + '把整段 Cookie（含 cf_clearance）與同一個瀏覽器的 UA 填進插件設置。'
-    );
+    // The app truncates long messages, so the diagnosis comes first and the
+    // per-host detail afterwards.
+    const head = failures.length && challenged === failures.length
+      ? 'MissAV：Cloudflare 拒絕（驗證頁 403）'
+      : 'MissAV：沒有可用入口';
+    throw new Error(`${head}\n${await this.diagnosis()}\n各站：${failures.join(' · ')}`);
+  }
+
+  // Short, truncation resistant summary of what the app actually sent. The
+  // user agent is reported with its length and both ends so it can be compared
+  // with the string the browser sends, character for character.
+  async diagnosis() {
+    const session = await this.session();
+    const cookie = session.cookie
+      ? `Cookie ${session.cookie.length} 字元${session.cookie.indexOf('cf_clearance=') >= 0 ? '·含 cf_clearance' : '·缺少 cf_clearance 名稱'}`
+      : 'Cookie 未設定';
+    const agent = session.agent
+      ? `UA ${session.agent.length} 字元（${session.agent.slice(0, 24)}…${session.agent.slice(-14)}）`
+      : 'UA 未設定（本體預設）';
+    const parts = [cookie, agent];
+    const age = this.clearanceAge(session.cookie);
+    if (age > 2 * 86400000) parts.push(`簽發於 ${Math.round(age / 86400000)} 天前`);
+    const ip = await this.egressIp();
+    if (ip) parts.push(`出口 ${ip}`);
+    return parts.join('；');
+  }
+
+  // The public address the app itself leaves from, for comparison with the
+  // browser that solved the challenge. Best effort only.
+  async egressIp() {
+    if (this._egress !== undefined) return this._egress;
+    this._egress = '';
+    try {
+      const text = await this.request('https://www.cloudflare.com/cdn-cgi/trace', { timeoutMs: 8000 });
+      const match = String(text).match(/^ip=([0-9a-f.:]+)$/im);
+      if (match) this._egress = match[1];
+    } catch (error) {
+      this._egress = '';
+    }
+    return this._egress;
   }
 
   async probeEntry(site) {
@@ -282,7 +326,7 @@ export default class extends Extension {
     }
     if (!agents.length) agents.push('');
 
-    let last = 'Cloudflare 驗證';
+    let last = 'challenge';
     for (let index = 0; index < agents.length; index++) {
       const agent = agents[index];
       // Without a cookie a challenge is expected, so only the configured agent
@@ -290,17 +334,18 @@ export default class extends Extension {
       if (index > 0 && !session.cookie) break;
       let body = '';
       try {
-        body = await this.get(site, `/${lang}`, agent);
+        body = await this.get(site, `/${lang}`, agent, false);
       } catch (error) {
-        last = String(error && error.message ? error.message : error).slice(0, 60);
+        last = String(error && error.message ? error.message : error).replace(/\s+/g, ' ').slice(0, 40);
         continue;
       }
-      if (this.challenged(body)) {
-        last = 'Cloudflare 驗證';
+      const kind = this.challengeKind(body);
+      if (kind) {
+        last = kind;
         continue;
       }
       if (!/thumbnail group|dm\d+\//i.test(body)) {
-        last = '不是預期的頁面';
+        last = 'page';
         continue;
       }
       if (agent && agent !== session.agent) {
@@ -583,7 +628,7 @@ export default class extends Extension {
     return age > 0 ? age : 0;
   }
 
-  async get(site, path, agentOverride) {
+  async get(site, path, agentOverride, diagnose) {
     this.state();
     const pace = () => {
       const wait = this._lastRequest + PAGE_GAP_MS - Date.now();
@@ -603,22 +648,13 @@ export default class extends Extension {
     });
     const body = typeof text === 'string' ? text : JSON.stringify(text);
     if (this.challenged(body)) {
-      const session = await this.session();
+      const kind = this.challengeKind(body) === 'block' ? '攔截頁' : '驗證頁';
       // The next attempt must re-read the settings: the user may have just
       // pasted a fresh clearance.
+      const summary = diagnose === false ? 'Cloudflare 驗證' : await this.diagnosis();
       this._session = null;
-      const age = this.clearanceAge(session.cookie);
-      const stale = age > 2 * 86400000
-        ? `\n這個 cf_clearance 看起來是 ${Math.round(age / 86400000)} 天前簽發的，多半已經過期。`
-        : '';
-      const kind = this.challengeKind(body) === 'block' ? '攔截頁（Attention Required）' : '驗證頁（Just a moment）';
-      throw new Error(
-        `MissAV 回傳 Cloudflare ${kind}。\n`
-        + `本次送出：Cookie ${session.cookie ? `（${session.cookie.length} 字元，${session.cookie.indexOf('cf_clearance=') >= 0 ? '含 cf_clearance' : '缺少 cf_clearance 名稱'}）` : '未設定'}，`
-        + `UA ${session.agent ? `（${session.agent.slice(0, 42)}…）` : '（本體預設）'}。${stale}\n`
-        + '請在瀏覽器打開 missav 通過驗證，把整段 Cookie（含 cf_clearance）與同一個瀏覽器的 UA 填進插件設置；'
-        + 'Cookie 過期後需要重新複製。'
-      );
+      // Kept short on purpose: the app truncates long error messages.
+      throw new Error(`MissAV：Cloudflare ${kind} 403\n${summary}`);
     }
     return body;
   }
