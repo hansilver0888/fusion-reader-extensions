@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         MissAV
-// @version      v1.1.1
+// @version      v1.1.2
 // @author       FusionReader
 // @lang         zh-tw
 // @license      MIT
@@ -54,8 +54,18 @@ const RESERVED_SLUGS = [
   'tags', 'vip', 'today-hot', 'weekly-hot', 'monthly-hot',
   'chinese-subtitle', 'english-subtitle', 'uncensored-leak',
 ];
+// A stale language list only costs a probe; the entry resolution keeps
+// whichever host answers.
 const PAGE_GAP_MS = 300;
 const PAGE_CACHE_MS = 30000;
+// cf_clearance is bound to the user agent that solved the challenge. When the
+// settings only carry a cookie, these are tried in order and the first that is
+// accepted is stored back into the settings.
+const FALLBACK_AGENTS = [
+  'Mozilla/5.0 (Linux; Android 16; Pixel 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Mobile Safari/537.36',
+  'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+];
 
 export default class extends Extension {
   state() {
@@ -136,6 +146,23 @@ export default class extends Extension {
     }
   }
 
+  // One field is often enough: "cookie: … ua: …", a "Copy as cURL" line and a
+  // bare cf_clearance value are all accepted, and the user agent is pulled out
+  // when it was pasted together with the cookie.
+  parseCredentials(raw) {
+    let text = (raw === undefined || raw === null ? '' : String(raw)).trim();
+    if (!text) return { cookie: '', agent: '' };
+    let agent = '';
+    const uaMarker = text.search(/(?:^|[\s;])(?:ua|user-agent)\s*[:=]/i);
+    if (uaMarker >= 0) {
+      const after = text.slice(uaMarker).replace(/^[\s;]*(?:ua|user-agent)\s*[:=]\s*/i, '');
+      const cookieMarker = after.search(/(?:^|[\s;])(?:cookie)\s*[:=]/i);
+      agent = (cookieMarker >= 0 ? after.slice(0, cookieMarker) : after).trim().replace(/^['"]|['"]$/g, '');
+      text = (cookieMarker >= 0 ? after.slice(cookieMarker) : text.slice(0, uaMarker)).trim();
+    }
+    return { cookie: this.normalizeCookie(text), agent: this.normalizeAgent(agent) };
+  }
+
   // A bare cf_clearance value is a common paste mistake: the cookie header
   // needs the name. "Copy as cURL" pastes are accepted as well.
   normalizeCookie(value) {
@@ -157,9 +184,12 @@ export default class extends Extension {
   async session() {
     this.state();
     if (!this._session) {
+      const pasted = this.parseCredentials(await this.setting('cookie'));
+      const configuredAgent = this.normalizeAgent(await this.setting('user_agent'));
       this._session = {
-        cookie: this.normalizeCookie(await this.setting('cookie')),
-        agent: this.normalizeAgent(await this.setting('user_agent')),
+        cookie: pasted.cookie,
+        // the user agent may have been pasted together with the cookie
+        agent: configuredAgent || pasted.agent,
         streamCookie: this.normalizeCookie(await this.setting('stream_cookie')),
         language: (await this.setting('language')).toLowerCase() || 'cn',
       };
@@ -167,19 +197,20 @@ export default class extends Extension {
     return this._session;
   }
 
-  async headers() {
+  async headers(agentOverride) {
     const session = await this.session();
     const headers = {
       'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
       Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     };
+    const agent = agentOverride || session.agent;
     // The app's dio CookieManager merges the request cookie with its jar using
     // the lowercase `cookie` key only, and replaces the header when the jar has
     // cookies for the host — so the clearance has to be present under that key,
     // otherwise the first CF response (which sets __cf_bm) hides it and every
     // later read is challenged. The capitalised copy is kept for clients that
     // read it directly.
-    if (session.agent) headers['User-Agent'] = session.agent;
+    if (agent) headers['User-Agent'] = agent;
     if (session.cookie) {
       headers.cookie = session.cookie;
       headers.Cookie = session.cookie;
@@ -236,16 +267,48 @@ export default class extends Extension {
   async probeEntry(site) {
     const session = await this.session();
     const lang = LANGUAGES.indexOf(session.language) >= 0 ? session.language : 'cn';
-    let body = '';
-    try {
-      body = await this.get(site, `/${lang}`);
-    } catch (error) {
-      return { ok: false, reason: String(error && error.message ? error.message : error).slice(0, 60) };
+    const agents = [];
+    if (session.agent) agents.push(session.agent);
+    for (const candidate of FALLBACK_AGENTS) {
+      if (agents.indexOf(candidate) < 0) agents.push(candidate);
     }
-    if (this.challenged(body)) return { ok: false, reason: 'Cloudflare 驗證' };
-    if (!/thumbnail group|dm\d+\//i.test(body)) return { ok: false, reason: '不是預期的頁面' };
-    this._lang = lang;
-    return { ok: true, reason: '' };
+    if (!agents.length) agents.push('');
+
+    let last = 'Cloudflare 驗證';
+    for (let index = 0; index < agents.length; index++) {
+      const agent = agents[index];
+      // Without a cookie a challenge is expected, so only the configured agent
+      // is worth trying.
+      if (index > 0 && !session.cookie) break;
+      let body = '';
+      try {
+        body = await this.get(site, `/${lang}`, agent);
+      } catch (error) {
+        last = String(error && error.message ? error.message : error).slice(0, 60);
+        continue;
+      }
+      if (this.challenged(body)) {
+        last = 'Cloudflare 驗證';
+        continue;
+      }
+      if (!/thumbnail group|dm\d+\//i.test(body)) {
+        last = '不是預期的頁面';
+        continue;
+      }
+      if (agent && agent !== session.agent) {
+        // cf_clearance is bound to its user agent: remember the pair that
+        // worked so the next start needs a single request.
+        session.agent = agent;
+        try {
+          await this.setSetting('user_agent', agent);
+        } catch (error) {
+          // read-only settings must not break browsing
+        }
+      }
+      this._lang = lang;
+      return { ok: true, reason: '' };
+    }
+    return { ok: false, reason: last };
   }
 
   normalizeEntry(value) {
@@ -496,7 +559,7 @@ export default class extends Extension {
     return task;
   }
 
-  async get(site, path) {
+  async get(site, path, agentOverride) {
     this.state();
     const pace = () => {
       const wait = this._lastRequest + PAGE_GAP_MS - Date.now();
@@ -507,7 +570,7 @@ export default class extends Extension {
     });
     await this._queue;
 
-    const text = await this.request(site + path, { headers: await this.headers() });
+    const text = await this.request(site + path, { headers: await this.headers(agentOverride) });
     const body = typeof text === 'string' ? text : JSON.stringify(text);
     if (this.challenged(body)) {
       const session = await this.session();

@@ -21,6 +21,7 @@ vm.runInContext(fs.readFileSync(new URL('../sources/missav.js', import.meta.url)
 const source = vm.runInContext('new Source()', context);
 source.webSite = 'https://missav.ai';
 source.getSetting = async (key) => ({ cookie: COOKIE, user_agent: UA, host: '' }[key] || '');
+source.setSetting = async () => {};
 source.sleep = async (ms) => new Promise((resolve) => setTimeout(resolve, Math.min(ms, 1000)));
 
 let requests = 0;

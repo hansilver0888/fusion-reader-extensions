@@ -16,6 +16,9 @@ function extension() {
   source._site = 'https://missav.ai';
   source._lang = 'cn';
   source.sleep = async () => {};
+  // The bridge never settles in the harness; settings are overridden per test.
+  source.getSetting = async () => '';
+  source.setSetting = async () => {};
   return source;
 }
 
@@ -75,6 +78,34 @@ test('cookies are normalised: bare tokens, full strings and cURL pastes', () => 
   assert.equal(source.normalizeAgent('Mozilla/5.0 Test'), 'Mozilla/5.0 Test');
 });
 
+test('a field holding "cookie: … ua: …" is split into both values', () => {
+  const source = extension();
+  const combined = source.parseCredentials('cookie:abc-token ua:Mozilla/5.0 (Linux; Android 16) Chrome/156 Mobile Safari/537.36');
+  assert.equal(combined.cookie, 'cf_clearance=abc-token');
+  assert.equal(combined.agent, 'Mozilla/5.0 (Linux; Android 16) Chrome/156 Mobile Safari/537.36');
+
+  const reversed = source.parseCredentials('ua:Mozilla/5.0 (X11) Test cookie:cf_clearance=xyz; a=1');
+  assert.equal(reversed.cookie, 'cf_clearance=xyz; a=1');
+  assert.equal(reversed.agent, 'Mozilla/5.0 (X11) Test');
+
+  const plain = source.parseCredentials('cf_clearance=abc');
+  assert.equal(plain.cookie, 'cf_clearance=abc');
+  assert.equal(plain.agent, '');
+  assert.deepEqual(JSON.parse(JSON.stringify(source.parseCredentials(''))), { cookie: '', agent: '' });
+});
+
+test('the agent pasted with the cookie is used when the ua field is empty', async () => {
+  const source = extension();
+  source.getSetting = async (key) => (key === 'cookie'
+    ? 'cookie:cf_clearance=abc ua:Mozilla/5.0 (Linux; Android 16) Chrome/156 Mobile'
+    : '');
+  const seen = [];
+  routes(source, { '/cn/new': listing([card({})]) }, seen);
+  await source.latest(1, 'new');
+  assert.equal(seen[0].headers['User-Agent'], 'Mozilla/5.0 (Linux; Android 16) Chrome/156 Mobile');
+  assert.equal(seen[0].headers.cookie, 'cf_clearance=abc');
+});
+
 test('entries are limited to the missav families and the probe uses the language root', async () => {
   const source = extension();
   assert.equal(source.normalizeEntry('missav.ai'), 'https://missav.ai');
@@ -108,6 +139,31 @@ test('a challenged host falls through to the next mirror and explains when all f
   dead.getSetting = async () => '';
   dead.request = async () => challengePage;
   await assert.rejects(dead.resolveEntry(), /沒有可用的 missav 入口|Cloudflare/);
+});
+
+test('a cookie without a user agent retries the candidate agents and stores the one that works', async () => {
+  const source = extension();
+  source._site = '';
+  source.getSetting = async (key) => ({
+    cookie: 'cf_clearance=abc',
+    user_agent: '',
+    language: 'cn',
+  }[key] || '');
+  const saved = [];
+  source.setSetting = async (key, value) => { saved.push([key, value]); };
+  const seen = [];
+  source.request = async (url, options) => {
+    seen.push({ url, agent: (options.headers || {})['User-Agent'] || '' });
+    if (url !== 'https://missav.ai/cn') return challengePage;
+    // only the second candidate is accepted by the edge
+    const agent = (options.headers || {})['User-Agent'] || '';
+    return agent.includes('Android 14') ? listing([card({})]) : challengePage;
+  };
+  assert.equal(await source.entry(), 'https://missav.ai');
+  assert.equal(seen.length, 2);
+  assert.ok(seen[0].agent.includes('Android 16'));
+  assert.ok(seen[1].agent.includes('Android 14'));
+  assert.deepEqual(saved, [['user_agent', seen[1].agent]]);
 });
 
 test('the cookie and user agent from the settings go out with every read', async () => {
