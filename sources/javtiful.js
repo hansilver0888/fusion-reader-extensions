@@ -1,6 +1,6 @@
-// ==MiruExtension==
+﻿// ==MiruExtension==
 // @name         Javtiful
-// @version      v1.0.0
+// @version      v1.0.1
 // @author       FusionReader
 // @lang         zh-tw
 // @license      MIT
@@ -50,6 +50,26 @@ export default class extends Extension {
 
   async load() {
     this.state();
+    try {
+      await this.registerSetting({
+        key: 'cover',
+        title: '封面樣式',
+        type: 'input',
+        description: 'portrait（預設）：詳情用人物豎圖，適合本體 120×170 的封面框；still：詳情用影片劇照（橫圖會被裁掉兩側）。列表封面不受影響。',
+        defaultValue: 'portrait',
+      });
+    } catch (error) {
+      // older runtimes without a settings ui still work with the default
+    }
+  }
+
+  async setting(key) {
+    try {
+      const value = await this.getSetting(key);
+      return value === undefined || value === null ? '' : String(value).trim();
+    } catch (error) {
+      return '';
+    }
   }
 
   // ---------- helpers ----------
@@ -142,7 +162,7 @@ export default class extends Extension {
       if (seen.has(path)) continue;
       const inner = match[4];
       const image = inner.match(/<img\b[^>]*>/i);
-      const cover = image ? this.absolute(this.attrValue(image[0], 'data-src') || this.attrValue(image[0], 'src')) : '';
+      const cover = image ? this.imageUrl(image[0]) : '';
       const title = this.textOf((image ? this.attrValue(image[0], 'alt') : '') || inner)
         .replace(/^Thumbnail for\s+/i, '')
         || this.slugTitle(match[3]);
@@ -151,6 +171,35 @@ export default class extends Extension {
       items.push({ title, url: path, cover, update: '' });
     }
     return items;
+  }
+
+  // The site lazily swaps a placeholder for the real thumbnail: the interesting
+  // attribute is data-front-lazy-src, and placeholder paths must never leak into
+  // a cover or the list shows a broken image.
+  imageUrl(tag) {
+    const raw = String(tag || '');
+    const direct = [
+      this.attrValue(raw, 'data-front-lazy-src'),
+      this.attrValue(raw, 'data-src'),
+      this.attrValue(raw, 'data-lazy-src'),
+      this.attrValue(raw, 'data-original'),
+    ].find((value) => value && !value.includes('video-thumb-placeholder'));
+    if (direct) return this.absolute(direct);
+    const srcset = this.attrValue(raw, 'srcset') || this.attrValue(raw, 'data-srcset');
+    if (srcset) {
+      const first = srcset.split(',').map((part) => part.trim().split(/\s+/)[0]).find((value) => value && !value.includes('video-thumb-placeholder'));
+      if (first) return this.absolute(first);
+    }
+    const src = this.attrValue(raw, 'src');
+    return src && !src.includes('video-thumb-placeholder') ? this.absolute(src) : '';
+  }
+
+  // The work page carries the performer's portrait next to the video still. The
+  // app's detail cover box is 120x170, so a 16:9 still is cropped to its middle;
+  // the portrait fills the box instead.
+  actressImage(html) {
+    const match = String(html).match(/\/uploads\/uploads\/collections\/actresses\/[^"'\s]+\.(?:jpg|jpeg|png|webp)/i);
+    return match ? this.absolute(match[0]) : '';
   }
 
   slugTitle(slug) {
@@ -170,7 +219,12 @@ export default class extends Extension {
         .replace(/\s*\|\s*Javtiful\s*$/i, '').trim()
       || target.slug;
     const poster = this.jsonField(html, 'videoPoster');
-    const cover = this.absolute(poster) || this.absolute(this.meta(html, 'og:image'));
+    const still = this.absolute(poster) || this.absolute(this.meta(html, 'og:image'));
+    // Only a portrait image fills the app's 120x170 cover box; the still stays
+    // available through the cover setting.
+    const style = (await this.setting('cover')) || 'portrait';
+    const portrait = this.actressImage(html);
+    const cover = style === 'still' ? still : (portrait || still);
     const desc = this.textOf(this.meta(html, 'description'));
     return {
       title,

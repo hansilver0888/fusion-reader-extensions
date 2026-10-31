@@ -1,6 +1,15 @@
-# Javtiful v1.0.0
+# Javtiful v1.0.1
 
 2026-10-31 实测 `javtiful.com`，验收基准仍是番号 **`SNOS-378`**：能搜到、能打开、能播完整片（不是 3 秒）。
+
+## v1.0.1 修正（封面）
+
+| 问题 | 原因 | 修法 |
+| --- | --- | --- |
+| 搜索/列表封面显示不出来 | 站点用懒加载：`<img src="/assets/front/media/video-thumb-placeholder.svg" data-front-lazy-src="真实图">`，插件原来取 `src`，拿到的是占位 SVG | 依次取 `data-front-lazy-src` / `data-src` / `data-lazy-src` / `data-original` / `srcset` 首个，并过滤 `video-thumb-placeholder` |
+| 详情封面「没居中」 | 本体的详情封面框是 **120×170 竖框 + `BoxFit.cover`**（`detail_page.dart`），站点的剧照是 **512×288 横图**，只能取中间一条；站点不提供竖版图，也没有可用裁切参数（`?w=480&h=680` 等返回同一张 44892 字节原图） | 详情默认改用页面里的**人物方图**（280×280，裁切小得多），贴合竖框；想用剧照可在设置「封面樣式」填 `still` |
+
+列表封面不受「封面樣式」影响，始终用剧照（列表格子本身就是横图）。
 
 ## 为什么换掉 123AV
 
@@ -41,7 +50,7 @@ Invalid data found when processing input
 
 ## 验证
 
-- 新增 7 项离线测试，仓库合计 140 项通过；覆盖分区/搜索路径与分页、卡片去重与前缀清理、详情字段、ticket POST 与最高档选择、无授权/坏 JSON/空源报错、作品地址校验。
+- 新增 8 项离线测试，仓库合计 119 项通过；覆盖分区/搜索路径与分页、卡片去重与前缀清理、详情字段、ticket POST 与最高档选择、无授权/坏 JSON/空源报错、作品地址校验。
 - 线上实测（`node tools/check_javtiful.mjs`，6 次插件请求）：
 
 ```

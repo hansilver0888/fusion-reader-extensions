@@ -63,8 +63,9 @@ console.log(JSON.stringify({
   newest: first.length,
   pageTwo: second.length,
   uncensored: uncensored.length,
-  search: { code: CODE, matches: found.length, hit: hit && hit.title.slice(0, 70) },
-  detail: { title: detail.title.slice(0, 80), cover: detail.cover.slice(0, 70) },
+  search: { code: CODE, matches: found.length, hit: hit && hit.title.slice(0, 70), cover: hit && hit.cover },
+  detail: { title: detail.title.slice(0, 80), cover: detail.cover.slice(0, 90) },
+  firstListingCover: first[0].cover.slice(0, 90),
   stream: { type: stream.type, host: stream.url.split('/')[2], status: media.status, contentType: media.headers.get('content-type'), isMp4, headBytes: head.length },
   requests,
 }, null, 2));

@@ -23,7 +23,7 @@ function extension() {
 const card = ({ id = '114372', slug = 'snos-378', title = 'SNOS-378 sample title', thumb = '/uploads/uploads/videos/thumbs/2026/10/09/233d4c671d0cc2d93b40644e3dfc4439.jpg' }) => `
 <article class="video-card">
   <a class="video-card__link" href="/ja/video/${id}/${slug}">
-    <img class="video-card__img" src="${thumb}" alt="Thumbnail for ${title}" loading="lazy">
+    <img class="video-card__img" src="/assets/front/media/video-thumb-placeholder.svg" data-front-lazy-src="${thumb}" alt="Thumbnail for ${title}" loading="lazy">
     <span class="video-card__duration">2:31:19</span>
   </a>
   <h3 class="video-card__title"><a href="/ja/video/${id}/${slug}">${title}</a></h3>
@@ -31,11 +31,12 @@ const card = ({ id = '114372', slug = 'snos-378', title = 'SNOS-378 sample title
 
 const listing = (cards) => `<!doctype html><html><body><div class="video-grid">${cards.join('\n')}</div></body></html>`;
 
-const workPage = ({ title = 'SNOS-378 中年男性が純白のIカップの胸に興奮し', poster = '/uploads/uploads/videos/thumbs/2026/10/09/233d4c671d0cc2d93b40644e3dfc4439.jpg', ticket = 'p1.114372.0.1793448576.abc.def', endpoint = '/ja/video/114372/playback' } = {}) => `<!doctype html><html><head>
+const workPage = ({ title = 'SNOS-378 中年男性が純白のIカップの胸に興奮し', poster = '/uploads/uploads/videos/thumbs/2026/10/09/233d4c671d0cc2d93b40644e3dfc4439.jpg', actress = '/uploads/uploads/collections/actresses/2026/04/27/5544e2b6b4adee534a771fd4fb845542.jpg', ticket = 'p1.114372.0.1793448576.abc.def', endpoint = '/ja/video/114372/playback' } = {}) => `<!doctype html><html><head>
 <title>${title} | Javtiful</title>
 <meta name="description" content="Javtiful で 紫堂るい 出演の SNOS-378 を無料で視聴">
 </head><body>
 <video id="front-player" preload="none" poster="${poster}"></video>
+${actress ? `<a class="actress" href="/ja/actress/1"><img src="${actress}" alt="紫堂るい" width="280" height="280"></a>` : ''}
 <script>window.initFrontPlayback = function (config) {}</script>
 <script>{"csrfFieldHtml":"","commentsEndpoint":"/ja/video/114372/comments","playback":{"endpoint":"${endpoint}","ticket":"${ticket}"},"videoTitle":"${title}","videoPoster":"${poster}"}</script>
 </body></html>`;
@@ -105,14 +106,42 @@ test('cards keep one entry per work and drop the thumbnail prefix', () => {
   assert.equal(items[0].cover, 'https://javtiful.com/uploads/uploads/videos/thumbs/2026/10/09/233d4c671d0cc2d93b40644e3dfc4439.jpg');
 });
 
-test('detail reads the page config', async () => {
+test('covers skip the lazy placeholder and use the real image', () => {
+  const source = extension();
+  assert.equal(
+    source.imageUrl('<img src="/assets/front/media/video-thumb-placeholder.svg" data-front-lazy-src="/uploads/a/b.jpg">'),
+    'https://javtiful.com/uploads/a/b.jpg',
+  );
+  assert.equal(
+    source.imageUrl('<img src="/assets/front/media/video-thumb-placeholder.svg" data-src="/uploads/c/d.jpg">'),
+    'https://javtiful.com/uploads/c/d.jpg',
+  );
+  assert.equal(
+    source.imageUrl('<img srcset="/uploads/e/f.jpg 1x, /uploads/e/f2.jpg 2x">'),
+    'https://javtiful.com/uploads/e/f.jpg',
+  );
+  // a placeholder on its own must not become a cover
+  assert.equal(source.imageUrl('<img src="/assets/front/media/video-thumb-placeholder.svg">'), '');
+});
+
+test('detail uses a portrait cover by default and the still when asked', async () => {
   const source = extension();
   routes(source, { '/ja/video/114372/snos-378': workPage({}) });
   const detail = await source.detail('/ja/video/114372/snos-378');
   assert.equal(detail.title, 'SNOS-378 中年男性が純白のIカップの胸に興奮し');
-  assert.ok(detail.cover.endsWith('233d4c671d0cc2d93b40644e3dfc4439.jpg'));
+  // the app's cover box is 120x170, so the performer portrait is preferred
+  assert.ok(detail.cover.endsWith('5544e2b6b4adee534a771fd4fb845542.jpg'), detail.cover);
   assert.ok(detail.desc.includes('SNOS-378'));
   assert.equal(detail.episodes[0].urls[0].url, '/ja/video/114372/snos-378');
+
+  const still = extension();
+  still.getSetting = async (key) => (key === 'cover' ? 'still' : '');
+  routes(still, { '/ja/video/114372/snos-378': workPage({}) });
+  assert.ok((await still.detail('/ja/video/114372/snos-378')).cover.endsWith('233d4c671d0cc2d93b40644e3dfc4439.jpg'));
+
+  const noActress = extension();
+  routes(noActress, { '/ja/video/114372/snos-378': workPage({ actress: '' }) });
+  assert.ok((await noActress.detail('/ja/video/114372/snos-378')).cover.endsWith('233d4c671d0cc2d93b40644e3dfc4439.jpg'));
 });
 
 test('watch trades the ticket for the largest signed mp4', async () => {
