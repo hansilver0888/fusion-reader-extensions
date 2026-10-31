@@ -1,6 +1,6 @@
 ﻿// ==MiruExtension==
 // @name         MissAV
-// @version      v1.1.6
+// @version      v1.1.7
 // @author       FusionReader
 // @lang         zh-tw
 // @license      MIT
@@ -115,6 +115,13 @@ export default class extends Extension {
         type: 'input',
         description: '介面語言代碼，預設 cn（cn / en / ja / ko …）。',
         defaultValue: 'cn',
+      },
+      {
+        key: 'route',
+        title: '連線方式',
+        type: 'input',
+        description: 'auto（預設，自動在直連與代理之間試）/ direct / proxy。cf_clearance 綁定出口 IP，必須與取 Cookie 時瀏覽器所用的線路一致。',
+        defaultValue: 'auto',
       },
       {
         key: 'host',
@@ -242,6 +249,7 @@ export default class extends Extension {
         agent: configuredAgent || pasted.agent,
         streamCookie: this.normalizeCookie(await this.setting('stream_cookie')),
         language: (await this.setting('language')).toLowerCase() || 'cn',
+        route: (await this.setting('route')).toLowerCase() || 'auto',
       };
     }
     return this._session;
@@ -370,40 +378,58 @@ export default class extends Extension {
     }
     if (!agents.length) agents.push('');
 
+    // The clearance is bound to the address it was issued to, and the browser
+    // that solved the challenge may well leave from a different route than the
+    // app's configured proxy. Try both routes and keep the one that answers.
+    const routes = session.route === 'proxy' ? ['proxy', 'direct']
+      : session.route === 'direct' ? ['direct']
+        : ['direct', 'proxy'];
+
     let last = 'challenge';
-    for (let index = 0; index < agents.length; index++) {
-      const agent = agents[index];
-      // Without a cookie a challenge is expected, so only the configured agent
-      // is worth trying.
-      if (index > 0 && !session.cookie) break;
-      let body = '';
-      try {
-        body = await this.get(site, `/${lang}`, agent, false);
-      } catch (error) {
-        last = String(error && error.message ? error.message : error).replace(/\s+/g, ' ').slice(0, 40);
-        continue;
-      }
-      const kind = this.challengeKind(body);
-      if (kind) {
-        last = kind;
-        continue;
-      }
-      if (!/thumbnail group|dm\d+\//i.test(body)) {
-        last = 'page';
-        continue;
-      }
-      if (agent && agent !== session.agent) {
-        // cf_clearance is bound to its user agent: remember the pair that
-        // worked so the next start needs a single request.
-        session.agent = agent;
+    for (const route of routes) {
+      for (let index = 0; index < agents.length; index++) {
+        const agent = agents[index];
+        // Without a cookie a challenge is expected, so only the configured agent
+        // is worth trying.
+        if (index > 0 && !session.cookie) break;
+        let body = '';
         try {
-          await this.setSetting('user_agent', agent);
+          body = await this.get(site, `/${lang}`, agent, false, route);
         } catch (error) {
-          // read-only settings must not break browsing
+          last = String(error && error.message ? error.message : error).replace(/\s+/g, ' ').slice(0, 40);
+          continue;
         }
+        const kind = this.challengeKind(body);
+        if (kind) {
+          last = kind;
+          continue;
+        }
+        if (!/thumbnail group|dm\d+\//i.test(body)) {
+          last = 'page';
+          continue;
+        }
+        this._route = route;
+        this._lang = lang;
+        const learned = [];
+        if (route !== session.route) {
+          session.route = route;
+          learned.push(['route', route]);
+        }
+        if (agent && agent !== session.agent) {
+          // cf_clearance is bound to its user agent: remember the pair that
+          // worked so the next start needs a single request.
+          session.agent = agent;
+          learned.push(['user_agent', agent]);
+        }
+        for (const [key, value] of learned) {
+          try {
+            await this.setSetting(key, value);
+          } catch (error) {
+            // read-only settings must not break browsing
+          }
+        }
+        return { ok: true, reason: '' };
       }
-      this._lang = lang;
-      return { ok: true, reason: '' };
     }
     return { ok: false, reason: last };
   }
@@ -636,7 +662,7 @@ export default class extends Extension {
         : [`${base}/source842.m3u8`, `${base}/1080p/video.m3u8`, `${base}/720p/video.m3u8`];
     // Quality variants are all served by the same host; the player takes the
     // first and reports a fetch error if that variant is not published.
-    return { type: 'hls', url: order[0], headers };
+    return { type: 'hls', url: order[0], headers, netMode: this._route };
   }
 
   // ---------- network ----------
@@ -672,7 +698,7 @@ export default class extends Extension {
     return age > 0 ? age : 0;
   }
 
-  async get(site, path, agentOverride, diagnose) {
+  async get(site, path, agentOverride, diagnose, route) {
     this.state();
     const pace = () => {
       const wait = this._lastRequest + PAGE_GAP_MS - Date.now();
@@ -686,10 +712,17 @@ export default class extends Extension {
     // The app throws on 4xx unless the source opts in, and the challenge page
     // *is* a 403: ask for the body so the failure can be explained instead of
     // bubbling up as a bare status code.
-    const text = await this.request(site + path, {
+    const options = {
       headers: await this.headers(agentOverride),
       allowErrorStatus: true,
-    });
+    };
+    // Headers matter less than the route here: the clearance only works from
+    // the address it was issued to, and the browser may not use the app's proxy.
+    const session = await this.session();
+    const netMode = route || this._route
+      || (session.route === 'direct' || session.route === 'proxy' ? session.route : '');
+    if (netMode) options.netMode = netMode;
+    const text = await this.request(site + path, options);
     const body = typeof text === 'string' ? text : JSON.stringify(text);
     if (this.challenged(body)) {
       const kind = this.challengeKind(body) === 'block' ? '攔截頁' : '驗證頁';

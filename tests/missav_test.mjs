@@ -205,7 +205,9 @@ test('a cookie without a user agent retries the candidate agents and stores the 
   assert.equal(seen.length, 2);
   assert.ok(seen[0].agent.includes('Android 16'));
   assert.ok(seen[1].agent.includes('Android 14'));
-  assert.deepEqual(saved, [['user_agent', seen[1].agent]]);
+  assert.ok(saved.some(([key, value]) => key === 'user_agent' && value === seen[1].agent), JSON.stringify(saved));
+  // the route that answered is remembered as well
+  assert.ok(saved.some(([key]) => key === 'route'), JSON.stringify(saved));
 });
 
 test('the cookie and user agent from the settings go out with every read', async () => {
@@ -411,12 +413,42 @@ test('a challenge error reports what was sent, the page kind and a stale clearan
   await assert.rejects(blocked.latest(1, 'new'), /Cloudflare 攔截頁 403/);
 });
 
-test('load registers the five settings even without a settings ui', async () => {
+test('the entry probe falls back to the other route and remembers it', async () => {
+  const source = extension();
+  source._site = '';
+  const saved = [];
+  source.getSetting = async (key) => ({ cookie: 'cf_clearance=abc12345', language: 'cn' }[key] || '');
+  source.setSetting = async (key, value) => { saved.push([key, value]); };
+  const routesSeen = [];
+  source.request = async (url, options) => {
+    if (url !== 'https://missav.ai/cn') return challengePage;
+    routesSeen.push((options || {}).netMode || 'none');
+    // only the proxied client gets a real page
+    return (options || {}).netMode === 'proxy' ? listing([card({})]) : challengePage;
+  };
+  assert.equal(await source.entry(), 'https://missav.ai');
+  // direct is tried first (several agent candidates), then proxy
+  assert.deepEqual(Array.from(new Set(routesSeen)), ['direct', 'proxy']);
+  assert.equal(routesSeen[routesSeen.length - 1], 'proxy');
+  assert.ok(saved.some(([key, value]) => key === 'route' && value === 'proxy'), JSON.stringify(saved));
+  assert.equal(source._route, 'proxy');
+
+  // subsequent reads keep using the route that worked
+  const seen = [];
+  source.request = async (url, options) => {
+    seen.push((options || {}).netMode);
+    return listing([card({ slug: 'dvmm-458' })]);
+  };
+  await source.latest(1, 'release');
+  assert.deepEqual(seen, ['proxy']);
+});
+
+test('load registers the six settings even without a settings ui', async () => {
   const source = extension();
   const registered = [];
   source.registerSetting = async (setting) => { registered.push(setting.key); };
   source.getSetting = async () => '';
   source.request = async () => listing([card({})]);
   await source.load();
-  assert.deepEqual(registered, ['cookie', 'user_agent', 'stream_cookie', 'language', 'host']);
+  assert.deepEqual(registered, ['cookie', 'user_agent', 'stream_cookie', 'language', 'route', 'host']);
 });
