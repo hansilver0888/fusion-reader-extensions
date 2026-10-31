@@ -1,4 +1,4 @@
-# MissAV v1.1.0
+# MissAV v1.1.1
 
 2026-10-31 用真实会话核对 `missav.ai`，完成单文件插件。只读取公开页面，不登录、不写入、不调用广告或统计接口。
 
@@ -14,7 +14,12 @@
 
 - **必须写成 Cookie 对**。只贴令牌值（`Chbng…`）→ 403；写成 `cf_clearance=Chbng…` → 200。插件会自动补上缺失的 `cf_clearance=` 名称，也接受整段 Cookie 和 DevTools 的「Copy as cURL」整行。
 - **UA 必须与通过验证的浏览器一致**。同一个令牌换成 Windows UA → 403；换回原 Android UA → 200。
+- **出口线路不影响**：同一会话直连与走 Clash 代理都返回 200（12 张卡），所以本体的路由不是变量。
 - `cf_clearance` 与客户端地址绑定，有效期数小时到数天，过期后需要重新复制。
+
+### 本体侧的 Cookie 头合并（v1.1.1 修正）
+
+本体的 `dio_cookie_manager 3.5.0` 在 `loadCookies()` 里只读**小写**的 `cookie` 头，再把请求头与它自带的 cookie jar 合并回写。插件原来只设大写 `Cookie`，于是当站点第一次响应写入 `__cf_bm` 后，jar 非空、请求头被替换成 jar 的内容，`cf_clearance` 不再发出，之后每次读取都被挑战。现在两种大小写同时发送，clearance 在合并后仍然保留。报错里也会附上「本次送出 Cookie 长度 / UA 是否自定义」，便于判断设置有没有生效。
 
 ## 站点结构（2026-10-31 实测）
 

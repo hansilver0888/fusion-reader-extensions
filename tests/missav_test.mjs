@@ -120,7 +120,10 @@ test('the cookie and user agent from the settings go out with every read', async
   routes(source, { '/cn/new': listing([card({})]) }, seen);
   await source.latest(1, 'new');
   assert.equal(seen.length, 1);
+  // the lowercase key is what the app's cookie manager merges with its jar
+  assert.equal(seen[0].headers.cookie, 'cf_clearance=abc; __cf_bm=1');
   assert.equal(seen[0].headers.Cookie, 'cf_clearance=abc; __cf_bm=1');
+  // the exact case keeps the app from appending its own user agent
   assert.equal(seen[0].headers['User-Agent'], 'Mozilla/5.0 (Linux; Android) Chrome/156 Mobile');
 });
 

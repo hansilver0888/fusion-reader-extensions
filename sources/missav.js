@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         MissAV
-// @version      v1.1.0
+// @version      v1.1.1
 // @author       FusionReader
 // @lang         zh-tw
 // @license      MIT
@@ -173,8 +173,17 @@ export default class extends Extension {
       'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
       Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     };
+    // The app's dio CookieManager merges the request cookie with its jar using
+    // the lowercase `cookie` key only, and replaces the header when the jar has
+    // cookies for the host — so the clearance has to be present under that key,
+    // otherwise the first CF response (which sets __cf_bm) hides it and every
+    // later read is challenged. The capitalised copy is kept for clients that
+    // read it directly.
     if (session.agent) headers['User-Agent'] = session.agent;
-    if (session.cookie) headers.Cookie = session.cookie;
+    if (session.cookie) {
+      headers.cookie = session.cookie;
+      headers.Cookie = session.cookie;
+    }
     return headers;
   }
 
@@ -501,8 +510,11 @@ export default class extends Extension {
     const text = await this.request(site + path, { headers: await this.headers() });
     const body = typeof text === 'string' ? text : JSON.stringify(text);
     if (this.challenged(body)) {
+      const session = await this.session();
       throw new Error(
         'MissAV 回傳 Cloudflare 驗證頁（Just a moment...）。\n'
+        + `本次送出：Cookie ${session.cookie ? `（${session.cookie.length} 字元）` : '未設定'}，`
+        + `UA ${session.agent ? '（自訂）' : '（本體預設）'}。\n`
         + '請在瀏覽器打開 missav 通過驗證，把整段 Cookie（含 cf_clearance）與同一個瀏覽器的 UA 填進插件設置；'
         + 'Cookie 過期後需要重新複製。'
       );
