@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         MissAV
-// @version      v1.0.0
+// @version      v1.1.0
 // @author       FusionReader
 // @lang         zh-tw
 // @license      MIT
@@ -12,44 +12,50 @@
 // @network      proxy
 // ==/MiruExtension==
 //
-// missav sits behind a Cloudflare managed challenge ("Just a moment..."): every
-// page and api path answers it to non-JS clients — node, python, reader
-// services and the app's own dart client — while only sitemap.xml is exempt.
-// Listings, the video page and the play address (surrit.com/<uuid>/…/video.m3u8,
-// the uuid lives in the page) therefore cannot be read without a session that
-// already passed the challenge.
+// missav answers every page with a Cloudflare managed challenge unless the
+// request carries a session that already passed it, so the plugin sends a
+// browser cookie and user agent from the plugin settings. cf_clearance is bound
+// to that pair (and to the client address), which is why both fields exist and
+// why the cookie stops working after a while.
 //
-// Two things make this usable from inside the app:
-//   * the plugin sends a browser cookie and user agent when the settings
-//     provide them (cf_clearance is bound to that pair and to the client ip);
-//   * the entry point is resolved among the known missav hosts, so a host that
-//     answers without a challenge is picked automatically.
-// Parsing stays tolerant on purpose: listing cards are recognised by their
-// work url shape and their thumbnail, and the play address is taken from the
-// first m3u8 the page prints, so a markup refresh does not break the source.
+// Page shape (checked 2026-10-31):
+//   * a listing is 12 cards of `div.thumbnail.group`; each card holds an anchor
+//     to `/<lang>/<code>`, a lazy `img` whose data-src is the cover
+//     (fourhoi.com/<code>/cover-t.jpg) and whose alt is the title, plus a
+//     duration badge;
+//   * work urls are `/<lang>/<code>` (some links carry a rotating `/dm<N>`
+//     prefix, which is optional — `/cn/new` and `/dm539/cn/new` are the same);
+//   * the play address is a surrit playlist. The page prints its uuid in the
+//     thumbnail strip (surrit.com/<uuid>/seek/_0.jpg) and assembles the
+//     playlist urls from a packed dictionary, giving
+//     `https://surrit.com/<uuid>/{1080p|720p}/video.m3u8` plus the default
+//     `source842.m3u8`.
+// surrit.com runs its own Cloudflare policy, so it can reject a client the page
+// itself allowed; an optional second cookie is sent with the stream for that
+// case.
 
 const DEFAULT_ENTRY = 'https://missav.ai';
 const KNOWN_ENTRIES = ['https://missav.ai', 'https://missav.ws', 'https://missav.live'];
 const HOSTS = /^(?:[a-z0-9-]+\.)*missav\.(?:ai|ws|live)$/i;
-const WORK_PATH = /\/dm\d+\/[a-z]{2}\/[^"?'#]+/i;
-// Listing pages link to their own sections with the same url shape as a work,
-// which is why a work slug also has to carry a title code (abp-123, fc2-123456).
-const RESERVED_SLUGS = [
-  'new', 'release', 'genres', 'actresses', 'makers', 'labels', 'series', 'search',
-  'articles', 'login', 'register', 'history', 'favorites', 'popular', 'trending',
-  'tags', 'uncensored', 'chinese-subtitle', 'english-subtitle', 'dm38',
-];
-// The site's urls carry a per-host line prefix (/dm38/zh, /dm19/ja …); the
-// resolved home page tells us which one the current host uses.
-const DEFAULT_LINE = 'dm38/zh';
-const PAGE_GAP_MS = 300;
-const PAGE_CACHE_MS = 30000;
-
-// The site's own feeds. `new` is newest first, `release` is the release list.
-const LISTINGS = [
+const LANGUAGES = ['cn', 'en', 'ja', 'ko', 'ms', 'th', 'de', 'fr', 'vi', 'id', 'zh'];
+const SECTIONS = [
   { title: '最新', key: 'new' },
   { title: '發售', key: 'release' },
+  { title: '今日熱門', key: 'today-hot' },
+  { title: '本週熱門', key: 'weekly-hot' },
+  { title: '本月熱門', key: 'monthly-hot' },
+  { title: '中文字幕', key: 'chinese-subtitle' },
+  { title: '英文字幕', key: 'english-subtitle' },
+  { title: '無碼流出', key: 'uncensored-leak' },
 ];
+const RESERVED_SLUGS = [
+  'new', 'release', 'search', 'genres', 'actresses', 'makers', 'labels', 'series',
+  'articles', 'login', 'register', 'history', 'favorites', 'popular', 'trending',
+  'tags', 'vip', 'today-hot', 'weekly-hot', 'monthly-hot',
+  'chinese-subtitle', 'english-subtitle', 'uncensored-leak',
+];
+const PAGE_GAP_MS = 300;
+const PAGE_CACHE_MS = 30000;
 
 export default class extends Extension {
   state() {
@@ -59,9 +65,9 @@ export default class extends Extension {
       this._lastRequest = 0;
       this._queue = Promise.resolve();
       this._site = this._site || '';
-      this._line = this._line || '';
+      this._lang = this._lang || '';
       this._entryPending = null;
-      this._cookie = null;
+      this._session = null;
     }
     return this;
   }
@@ -73,15 +79,29 @@ export default class extends Extension {
         key: 'cookie',
         title: '瀏覽器 Cookie',
         type: 'password',
-        description: '在瀏覽器打開 missav（已通過驗證）後，複製含 cf_clearance 的整段 Cookie。留空則只嘗試免驗證的主機。',
+        description: '在瀏覽器打開 missav（已通過驗證）後，複製 Cookie；可貼整段，也可只貼 cf_clearance 的值，插件會自動補上名稱。',
         defaultValue: '',
       },
       {
         key: 'user_agent',
         title: '瀏覽器 UA',
         type: 'input',
-        description: '與上面 Cookie 同一瀏覽器的 User-Agent；cf_clearance 與 UA 綁定，留空使用本體預設。',
+        description: '與上面 Cookie 同一瀏覽器的 User-Agent（必須一致，否則 cf_clearance 無效）。',
         defaultValue: '',
+      },
+      {
+        key: 'stream_cookie',
+        title: '播放域名 Cookie',
+        type: 'password',
+        description: '可選。播放域名 surrit.com 若單獨要求驗證，把該域名的 Cookie 貼在這裡；留空則只帶 Referer。',
+        defaultValue: '',
+      },
+      {
+        key: 'language',
+        title: '語言',
+        type: 'input',
+        description: '介面語言代碼，預設 cn（cn / en / ja / ko …）。',
+        defaultValue: 'cn',
       },
       {
         key: 'host',
@@ -116,20 +136,45 @@ export default class extends Extension {
     }
   }
 
-  async headers() {
+  // A bare cf_clearance value is a common paste mistake: the cookie header
+  // needs the name. "Copy as cURL" pastes are accepted as well.
+  normalizeCookie(value) {
+    const raw = (value === undefined || value === null ? '' : String(value)).trim();
+    if (!raw) return '';
+    const curl = raw.match(/-H\s+['"]cookie:\s*([^'"]+)['"]/i);
+    const text = (curl ? curl[1] : raw.replace(/^cookie:\s*/i, '')).trim();
+    if (/^(?:[A-Za-z0-9_.-]+=[^;]*;?\s*)+$/.test(text)) return text;
+    return `cf_clearance=${text}`;
+  }
+
+  normalizeAgent(value) {
+    const raw = (value === undefined || value === null ? '' : String(value)).trim();
+    if (!raw) return '';
+    const curl = raw.match(/-H\s+['"]user-agent:\s*([^'"]+)['"]/i);
+    return (curl ? curl[1] : raw.replace(/^user-agent:\s*/i, '')).trim();
+  }
+
+  async session() {
     this.state();
-    if (!this._cookie) {
-      this._cookie = {
-        cookie: await this.setting('cookie'),
-        agent: await this.setting('user_agent'),
+    if (!this._session) {
+      this._session = {
+        cookie: this.normalizeCookie(await this.setting('cookie')),
+        agent: this.normalizeAgent(await this.setting('user_agent')),
+        streamCookie: this.normalizeCookie(await this.setting('stream_cookie')),
+        language: (await this.setting('language')).toLowerCase() || 'cn',
       };
     }
+    return this._session;
+  }
+
+  async headers() {
+    const session = await this.session();
     const headers = {
       'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
       Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     };
-    if (this._cookie.agent) headers['User-Agent'] = this._cookie.agent;
-    if (this._cookie.cookie) headers.Cookie = this._cookie.cookie;
+    if (session.agent) headers['User-Agent'] = session.agent;
+    if (session.cookie) headers.Cookie = session.cookie;
     return headers;
   }
 
@@ -169,31 +214,29 @@ export default class extends Extension {
     while (queue.length) {
       const site = queue.shift();
       const result = await this.probeEntry(site);
-      if (result.ok) {
-        this._line = result.line || DEFAULT_LINE;
-        return site;
-      }
+      if (result.ok) return site;
       failures.push(`${site}（${result.reason}）`);
     }
     throw new Error(
-      '沒有可用的 missav 入口。\n'
-      + failures.join('\n')
-      + '\n站點由 Cloudflare 挑戰保護：請在瀏覽器打開一次 missav 並通過驗證，'
-      + '然後把整段 Cookie（含 cf_clearance）和瀏覽器 UA 填進插件設置。'
+      '沒有可用的 missav 入口。\n' + failures.join('\n')
+      + '\n站點由 Cloudflare 挑戰保護：在瀏覽器打開一次 missav 並通過驗證，'
+      + '把整段 Cookie（含 cf_clearance）與同一個瀏覽器的 UA 填進插件設置。'
     );
   }
 
   async probeEntry(site) {
+    const session = await this.session();
+    const lang = LANGUAGES.indexOf(session.language) >= 0 ? session.language : 'cn';
     let body = '';
     try {
-      body = await this.get(site, '/');
+      body = await this.get(site, `/${lang}`);
     } catch (error) {
-      return { ok: false, line: '', reason: String(error && error.message ? error.message : error).slice(0, 60) };
+      return { ok: false, reason: String(error && error.message ? error.message : error).slice(0, 60) };
     }
-    if (this.challenged(body)) return { ok: false, line: '', reason: 'Cloudflare 驗證' };
-    if (!/missav|dm\d+\//i.test(body)) return { ok: false, line: '', reason: '不是預期的頁面' };
-    const line = body.match(/\/(dm\d+)\/([a-z]{2})\//i);
-    return { ok: true, line: line ? `${line[1]}/${line[2]}` : '', reason: '' };
+    if (this.challenged(body)) return { ok: false, reason: 'Cloudflare 驗證' };
+    if (!/thumbnail group|dm\d+\//i.test(body)) return { ok: false, reason: '不是預期的頁面' };
+    this._lang = lang;
+    return { ok: true, reason: '' };
   }
 
   normalizeEntry(value) {
@@ -211,8 +254,10 @@ export default class extends Extension {
     return this._site || DEFAULT_ENTRY;
   }
 
-  line() {
-    return this._line || DEFAULT_LINE;
+  async language() {
+    if (this._lang) return this._lang;
+    const session = await this.session();
+    return LANGUAGES.indexOf(session.language) >= 0 ? session.language : 'cn';
   }
 
   // ---------- helpers ----------
@@ -266,68 +311,68 @@ export default class extends Extension {
 
   challenged(body) {
     const text = String(body || '');
-    return /Just a moment|cf-challenge|challenges\.cloudflare\.com|cf-mitigated/i.test(text)
-      && !/\/dm\d+\/[a-z]{2}\//i.test(text);
+    if (!/Just a moment|cf-challenge|challenges\.cloudflare\.com/i.test(text)) return false;
+    return !/thumbnail group|\/dm\d+\/[a-z]{2}\//i.test(text);
   }
 
-  // Returns the work path for a link, or '' when the link is a section of the
-  // site (genres, actresses, search …) rather than a work.
+  // Work urls are `/<lang>/<code>` and may carry a rotating `/dm<N>` prefix.
   parseWork(path) {
     const text = String(path || '');
-    const match = text.match(/^\/dm\d+\/[a-z]{2}\/([^/?#]+)\/?$/i);
+    const match = text.match(/^\/(?:dm\d+\/)?([a-z]{2})\/([^/?#]+)\/?$/i);
     if (!match) return '';
-    const slug = match[1].toLowerCase();
-    if (RESERVED_SLUGS.indexOf(slug) >= 0) return '';
-    if (!/^[a-z0-9][a-z0-9._-]*$/.test(slug)) return '';
-    if (!/\d/.test(slug)) return '';
-    return text.replace(/\/$/, '');
+    const lang = match[1].toLowerCase();
+    if (LANGUAGES.indexOf(lang) < 0) return '';
+    const slug = match[2];
+    const lower = slug.toLowerCase();
+    if (RESERVED_SLUGS.indexOf(lower) >= 0) return '';
+    if (!/^[a-z0-9][a-z0-9._-]*$/i.test(slug)) return '';
+    // title codes carry digits: mina-019, dvmm-458, fc2-ppv-4997591, 123456_001
+    if (!/-\d/.test(slug) && !/^\d{6}[_-]/.test(slug)) return '';
+    return `/${lang}/${slug}`;
   }
 
   // ---------- channels ----------
 
   async channels() {
-    return LISTINGS.map((listing) => ({ title: listing.title, key: listing.key }));
+    return SECTIONS.map((section) => ({ title: section.title, key: section.key }));
   }
 
   async latest(page, channel) {
     const number = this.pageNumber(page);
     const key = (channel === undefined || channel === null ? '' : String(channel)).trim();
-    const listing = LISTINGS.find((item) => item.key === key) || LISTINGS[0];
-    const path = `/${this.line()}/${listing.key}${number > 1 ? `?page=${number}` : ''}`;
-    const html = await this.page(path);
-    return this.cards(html);
+    const section = SECTIONS.find((item) => item.key === key) || SECTIONS[0];
+    const lang = await this.language();
+    const path = `/${lang}/${section.key}${number > 1 ? `?page=${number}` : ''}`;
+    return this.cards(await this.page(path));
   }
 
   async search(kw, page) {
     const keyword = (kw === undefined || kw === null ? '' : String(kw)).trim();
     if (!keyword) return [];
     const number = this.pageNumber(page);
-    const path = `/${this.line()}/search/${encodeURIComponent(keyword)}${number > 1 ? `?page=${number}` : ''}`;
+    const lang = await this.language();
+    const path = `/${lang}/search/${encodeURIComponent(keyword)}${number > 1 ? `?page=${number}` : ''}`;
     return this.cards(await this.page(path));
   }
 
-  // Listing cards are recognised by their work url and their thumbnail, which
-  // survives the small class-name changes the site ships.
+  // Cards are `div.thumbnail.group` blocks; the anchor, the lazy image and the
+  // duration badge live inside, so the section links around them are ignored.
   cards(html) {
     const source = String(html);
+    const blocks = source.split(/class="thumbnail group"/).slice(1);
     const items = [];
     const seen = new Set();
-    const anchor = /<a\b[^>]*href="([^"]*\/dm\d+\/[a-z]{2}\/[^"]+)"[^>]*>([\s\S]{0,2000}?)<\/a>/gi;
-    let match;
-    while ((match = anchor.exec(source)) !== null) {
-      const href = this.absolute(match[1]);
-      if (!href) continue;
-      const path = this.parseWork(href.replace(/^https?:\/\/[^/]+/i, ''));
+    for (const block of blocks) {
+      const anchor = (block.match(/<a\b[^>]*href="([^"]+)"[^>]*>/i) || [])[1] || '';
+      const path = this.parseWork(anchor.replace(/^https?:\/\/[^/]+/i, ''));
       if (!path || seen.has(path)) continue;
-      const inner = match[2];
-      const image = inner.match(/<img\b[^>]*>/i);
+      const image = block.match(/<img\b[^>]*>/i);
       const cover = image ? this.absolute(this.attrValue(image[0], 'data-src') || this.attrValue(image[0], 'src')) : '';
-      const title = this.textOf(
-        (image ? this.attrValue(image[0], 'alt') : '') || inner
-      );
-      if (!title && !cover) continue;
+      const title = this.textOf(image ? this.attrValue(image[0], 'alt') : '')
+        || this.textOf((block.match(/class="my-2 text-sm[^"]*"[^>]*>([\s\S]{0,200}?)</i) || [])[1] || '');
+      const duration = this.textOf((block.match(/bottom-1 right-1[^"]*"[^>]*>([^<]{0,20})</i) || [])[1]);
       seen.add(path);
-      items.push({ title: title || path, url: path, cover, update: '' });
+      items.push({ title: title || path.split('/').pop(), url: path, cover, update: duration });
     }
     return items;
   }
@@ -337,15 +382,28 @@ export default class extends Extension {
   async detail(url) {
     const target = this.target(url);
     const html = await this.page(target.path);
-    const title = this.textOf(this.meta(html, 'og:title')).replace(/\s*[-|]\s*MissAV.*$/i, '') || target.slug;
-    const cover = this.absolute(this.meta(html, 'og:image'));
-    const desc = this.textOf(this.meta(html, 'description') || (html.match(/<h1[^>]*>([\s\S]{0,200}?)<\/h1>/i) || [])[1]);
+    const title = this.textOf(this.meta(html, 'og:title')).replace(/\s*[-|]\s*MissAV.*$/i, '')
+      || this.textOf((html.match(/<h1[^>]*>([\s\S]{0,200}?)<\/h1>/i) || [])[1] || '')
+      || target.slug;
+    const cover = this.absolute(this.meta(html, 'og:image')) || this.coverFor(target.slug);
+    const desc = this.textOf(this.meta(html, 'og:description'));
     return {
       title,
       cover,
       desc,
-      episodes: [{ title: '影片', urls: [{ name: title, url: target.path }] }],
+      episodes: [{
+        title: '畫質',
+        urls: [
+          { name: '1080p', url: `${target.path}#1080p` },
+          { name: '720p', url: `${target.path}#720p` },
+          { name: '預設', url: target.path },
+        ],
+      }],
     };
+  }
+
+  coverFor(slug) {
+    return slug ? `https://fourhoi.com/${encodeURIComponent(slug)}/cover-t.jpg` : '';
   }
 
   target(url) {
@@ -355,10 +413,11 @@ export default class extends Extension {
       const host = (text.match(/^https?:\/\/([^/?#]+)/i) || [])[1] || '';
       if (!HOSTS.test(host)) throw new Error('無效的影片地址：' + text);
     }
-    const raw = text.replace(/^https?:\/\/[^/]+/i, '').replace(/[?#].*$/, '');
+    const quality = (text.match(/#(\d{3,4}p)\s*$/i) || [])[1] || '';
+    const raw = text.replace(/#.*$/, '').replace(/^https?:\/\/[^/]+/i, '').replace(/[?].*$/, '');
     const path = this.parseWork(raw);
     if (!path) throw new Error('無法解析影片地址：' + text);
-    return { path, slug: path.split('/').filter(Boolean).pop() };
+    return { path, slug: path.split('/').pop(), quality };
   }
 
   // ---------- playback ----------
@@ -366,35 +425,42 @@ export default class extends Extension {
   async watch(url) {
     const target = this.target(url);
     const html = await this.page(target.path);
-    const streams = this.streams(html);
-    if (!streams.length) {
+    const stream = await this.streamFor(html, target.quality);
+    if (!stream) {
       throw new Error(
-        '這個頁面沒有內嵌播放地址。\n'
-        + '若列表能打開但這裡失敗，通常是 Cookie 過期（cf_clearance 只有效數小時到數天），'
+        '這個頁面找不到播放地址。\n'
+        + '若列表能打開而這裡失敗，通常是 Cookie 過期（cf_clearance 只有效數小時到數天），'
         + '重新從瀏覽器複製一次即可。'
       );
     }
-    return { type: streams[0].includes('.m3u8') ? 'hls' : 'mp4', url: streams[0], headers: { Referer: this.currentSite() + '/' } };
+    return stream;
   }
 
-  streams(html) {
-    const source = String(html || '');
-    const found = [];
-    const seen = new Set();
-    const push = (value) => {
-      const url = this.absolute(String(value || '').replace(/\\\//g, '/'));
-      if (!url || !/\.(?:m3u8|mp4)(?:[?#]|$)/i.test(url) || seen.has(url)) return;
-      seen.add(url);
-      found.push(url);
-    };
-    for (const tag of source.match(/(?:data-)?src\s*=\s*["']([^"']+)["']/gi) || []) {
-      push((tag.match(/["']([^"']+)["']/) || [])[1]);
+  async streamFor(html, quality) {
+    // The page escapes every slash inside its scripts, so the lookups run on a
+    // cooked copy.
+    const source = String(html || '').replace(/\\\//g, '/');
+    const session = await this.session();
+    // The uuid is printed in the thumbnail strip even though the play urls are
+    // assembled by the page's own script.
+    const uuid = (source.match(/surrit\.com\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i) || [])[1];
+    const headers = { Referer: 'https://missav.ai/' };
+    if (session.streamCookie) headers.Cookie = session.streamCookie;
+    if (!uuid) {
+      const direct = (source.match(/["'](https?:\/\/[^"'\s]+?\.m3u8[^"'\s]*)["']/i) || [])[1];
+      if (!direct) return null;
+      return { type: 'hls', url: this.absolute(direct), headers };
     }
-    for (const match of source.match(/https?:\/\/[^"'\s\\]+?\.(?:m3u8|mp4)[^"'\s\\]*/gi) || []) push(match);
-    // Surrit serves the playlist per quality; the master one ends in video.m3u8.
-    return found
-      .filter((url) => /\.m3u8/i.test(url) || /\.mp4/i.test(url))
-      .sort((a, b) => (/(?:video|playlist)\.m3u8$/i.test(b) ? 1 : 0) - (/(?:video|playlist)\.m3u8$/i.test(a) ? 1 : 0));
+    const base = `https://surrit.com/${uuid}`;
+    const wanted = (quality || '').toLowerCase();
+    const order = wanted === '720p'
+      ? [`${base}/720p/video.m3u8`, `${base}/1080p/video.m3u8`, `${base}/source842.m3u8`]
+      : wanted === '1080p'
+        ? [`${base}/1080p/video.m3u8`, `${base}/720p/video.m3u8`, `${base}/source842.m3u8`]
+        : [`${base}/source842.m3u8`, `${base}/1080p/video.m3u8`, `${base}/720p/video.m3u8`];
+    // Quality variants are all served by the same host; the player takes the
+    // first and reports a fetch error if that variant is not published.
+    return { type: 'hls', url: order[0], headers };
   }
 
   // ---------- network ----------
@@ -437,7 +503,7 @@ export default class extends Extension {
     if (this.challenged(body)) {
       throw new Error(
         'MissAV 回傳 Cloudflare 驗證頁（Just a moment...）。\n'
-        + '請在瀏覽器打開 missav 通過驗證，把整段 Cookie（含 cf_clearance）與瀏覽器 UA 填進插件設置；'
+        + '請在瀏覽器打開 missav 通過驗證，把整段 Cookie（含 cf_clearance）與同一個瀏覽器的 UA 填進插件設置；'
         + 'Cookie 過期後需要重新複製。'
       );
     }

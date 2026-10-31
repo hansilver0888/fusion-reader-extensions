@@ -3,9 +3,9 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import { test } from 'node:test';
 
-// The frames below repeat the shape the site ships: work anchors, a lazy
-// thumbnail, og meta on the video page and an embedded playlist. No real page
-// or media url is stored in this repository.
+// The frames below repeat the shape the site ships (checked 2026-10-31):
+// `div.thumbnail.group` cards, `/<lang>/<code>` work urls, the lazy cover on
+// fourhoi and a surrit uuid printed in the thumbnail strip.
 function extension() {
   const context = vm.createContext({ sendMessage() {}, Date });
   vm.runInContext(fs.readFileSync(new URL('../fixtures/runtime.js', import.meta.url), 'utf8'), context);
@@ -14,6 +14,7 @@ function extension() {
   const source = vm.runInContext('new Source()', context);
   source.webSite = 'https://missav.ai';
   source._site = 'https://missav.ai';
+  source._lang = 'cn';
   source.sleep = async () => {};
   return source;
 }
@@ -21,22 +22,34 @@ function extension() {
 const challengePage = '<!DOCTYPE html><html><head><title>Just a moment...</title></head>'
   + '<body><script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script></body></html>';
 
-const card = ({ slug, title, cover = `https://fourhoi.com/${slug}/cover-n.jpg`, dm = 'dm38' }) => `
-<div class="thumbnail group">
-  <a href="/${dm}/zh/${slug}" class="cover">
-    <img data-src="${cover}" src="data:image/gif;base64,R0lGOD" alt="${title}">
-  </a>
-  <div class="title"><a href="/${dm}/zh/${slug}">${title}</a></div>
+const card = ({ slug = 'mina-019', title = '示例作品 月野友音', duration = '2:00:00', lang = 'cn', prefix = '' }) => `
+<div >
+  <div @mouseenter="setPreview('x')" @click="clickPreview('x')" class="thumbnail group" >
+    <div class="relative aspect-w-16 aspect-h-9 rounded overflow-hidden shadow-lg">
+      <a href="https://missav.ai/${lang}/${slug}" alt="${slug}" >
+        <video class="preview hidden" loop muted data-src="https://fourhoi.com/${slug}/preview.mp4"></video>
+        <img class="lozad w-full" data-src="https://fourhoi.com/${slug}/cover-t.jpg" src="data:image/png;base64,AA" alt="${title}" >
+      </a>
+      <a href="https://missav.ai/${lang}/${slug}" alt="${slug}" >
+        <span class="absolute bottom-1 right-1 rounded-lg px-2 py-1 text-xs text-nord5 bg-gray-800">${duration}</span>
+      </a>
+    </div>
+  </div>
 </div>`;
 
-const listing = (cards) => `<!doctype html><html><body><div class="grid">${cards.join('\n')}</div></body></html>`;
+const listing = (cards, extra = '') => `<!doctype html><html><body>
+<nav><a href="/dm539/cn/new">最新</a><a href="/dm635/cn/release">發售</a><a href="/cn/genres">分類</a></nav>
+${extra}
+<div class="grid">${cards.join('\n')}</div>
+</body></html>`;
 
-const videoPage = ({ title = 'ABP-123 示例標題', cover = 'https://fourhoi.com/abp-123/cover-n.jpg', stream = 'https://surrit.com/1c2e-uuid/1080p/video.m3u8' } = {}) => `<!doctype html><html><head>
-<meta property="og:title" content="${title} - MissAV">
+const uuid = 'e0258f43-b477-46a3-8dd8-415ef7ef399b';
+const workPage = ({ title = 'MINA-019 示例作品 - 月野ゆりね', cover = 'https://fourhoi.com/mina-019/cover-t.jpg', stream = true } = {}) => `<!doctype html><html><head>
+<meta property="og:title" content="${title} - MissAV | 免费高清AV在线看">
 <meta property="og:image" content="${cover}">
-<meta name="description" content="示例描述文字">
+<meta property="og:description" content="示例描述文字">
 </head><body><h1>${title}</h1>
-<video id="player" class="player" data-src="${stream}" poster="${cover}"></video>
+${stream ? `<img src="https:\\/\\/surrit.com\\/${uuid}\\/seek\\/_0.jpg">` : ''}
 </body></html>`;
 
 function routes(source, map, seen) {
@@ -51,164 +64,179 @@ function routes(source, map, seen) {
   return requests;
 }
 
-test('entries are limited to the missav families and normalised', () => {
+test('cookies are normalised: bare tokens, full strings and cURL pastes', () => {
+  const source = extension();
+  assert.equal(source.normalizeCookie('abc-123'), 'cf_clearance=abc-123');
+  assert.equal(source.normalizeCookie('cf_clearance=abc; __cf_bm=1'), 'cf_clearance=abc; __cf_bm=1');
+  assert.equal(source.normalizeCookie('Cookie: cf_clearance=abc'), 'cf_clearance=abc');
+  assert.equal(source.normalizeCookie(`curl 'https://x' -H 'cookie: cf_clearance=abc; x=1' -H 'user-agent: UA'`), 'cf_clearance=abc; x=1');
+  assert.equal(source.normalizeCookie(''), '');
+  assert.equal(source.normalizeAgent(`curl x -H 'user-agent: Mozilla/5.0 Test'`), 'Mozilla/5.0 Test');
+  assert.equal(source.normalizeAgent('Mozilla/5.0 Test'), 'Mozilla/5.0 Test');
+});
+
+test('entries are limited to the missav families and the probe uses the language root', async () => {
   const source = extension();
   assert.equal(source.normalizeEntry('missav.ai'), 'https://missav.ai');
   assert.equal(source.normalizeEntry('https://missav.ws/'), 'https://missav.ws');
-  assert.equal(source.normalizeEntry('http://missav.live'), 'https://missav.live');
   assert.equal(source.normalizeEntry('https://missav.com'), '');
-  assert.equal(source.normalizeEntry('https://missav.ai/dm38/zh'), '');
-  assert.equal(source.normalizeEntry(''), '');
+  assert.equal(source.normalizeEntry('https://missav.ai/cn'), '');
+
+  const probe = extension();
+  probe._site = '';
+  probe.getSetting = async (key) => (key === 'language' ? 'cn' : '');
+  const requests = routes(probe, {
+    '/cn': listing([card({})]),
+  });
+  assert.equal(await probe.entry(), 'https://missav.ai');
+  assert.equal(probe._lang, 'cn');
+  assert.deepEqual(requests.map((entry) => entry.url), ['https://missav.ai/cn']);
 });
 
-test('a challenged host is reported with the cookie instructions', async () => {
+test('a challenged host falls through to the next mirror and explains when all fail', async () => {
   const source = extension();
   source._site = '';
   source.getSetting = async () => '';
-  routes(source, {
-    '/': () => { throw new Error('HTTP 403'); },
-  });
-  await assert.rejects(source.entry(), /沒有可用的 missav 入口|Cloudflare/);
-});
-
-test('the first host that answers without a challenge wins', async () => {
-  const source = extension();
-  source._site = '';
-  source.getSetting = async () => '';
-  const requests = routes(source, {
-    '/': challengePage,
-  });
-  // missav.ai and missav.ws are challenged, missav.live answers
-  requests.length = 0;
   source.request = async (url) => {
-    requests.push({ url });
-    if (url.startsWith('https://missav.ai/') || url.startsWith('https://missav.ws/')) return challengePage;
-    return '<html><body><a href="/dm38/zh/abp-123">work</a></body></html>';
+    if (url.startsWith('https://missav.live/')) return listing([card({})]);
+    return challengePage;
   };
   assert.equal(await source.resolveEntry(), 'https://missav.live');
+
+  const dead = extension();
+  dead._site = '';
+  dead.getSetting = async () => '';
+  dead.request = async () => challengePage;
+  await assert.rejects(dead.resolveEntry(), /沒有可用的 missav 入口|Cloudflare/);
 });
 
-test('the cookie and user agent from the settings are sent with every read', async () => {
+test('the cookie and user agent from the settings go out with every read', async () => {
   const source = extension();
-  const values = { cookie: 'cf_clearance=abc; session=1', user_agent: 'Mozilla/5.0 (X11) TestBrowser/1.0' };
-  source.getSetting = async (key) => values[key] || '';
+  source.getSetting = async (key) => ({
+    cookie: 'cf_clearance=abc; __cf_bm=1',
+    user_agent: 'Mozilla/5.0 (Linux; Android) Chrome/156 Mobile',
+  }[key] || '');
   const seen = [];
-  routes(source, { '/dm38/zh/new': listing([card({ slug: 'abp-123', title: '示例作品' })]) }, seen);
+  routes(source, { '/cn/new': listing([card({})]) }, seen);
   await source.latest(1, 'new');
   assert.equal(seen.length, 1);
-  assert.equal(seen[0].headers.Cookie, 'cf_clearance=abc; session=1');
-  assert.equal(seen[0].headers['User-Agent'], 'Mozilla/5.0 (X11) TestBrowser/1.0');
-  assert.ok(seen[0].headers['Accept-Language']);
+  assert.equal(seen[0].headers.Cookie, 'cf_clearance=abc; __cf_bm=1');
+  assert.equal(seen[0].headers['User-Agent'], 'Mozilla/5.0 (Linux; Android) Chrome/156 Mobile');
 });
 
-test('listing channels page the site feeds and parse work cards tolerantly', async () => {
+test('listing sections and search build the site paths and page them', async () => {
   const source = extension();
   source.getSetting = async () => '';
   const requests = routes(source, {
-    '/dm38/zh/release?page=2': listing([
-      card({ slug: 'abp-123', title: '示例作品 &amp; 副標題' }),
-      card({ slug: 'ssis-456', title: '第二部作品', dm: 'dm51' }),
-      card({ slug: 'abp-123', title: '重複的作品' }),
-      '<div class="thumbnail"><a href="/dm38/zh/genres">分類</a></div>',
-    ]),
-    '/dm38/zh/new': listing([card({ slug: 'abp-123', title: '示例作品 &amp; 副標題' })]),
+    '/cn/new': listing([card({ slug: 'mina-019', title: '示例作品' })]),
+    '/cn/release?page=2': listing([card({ slug: 'dvmm-458', title: '第二部' })]),
+    '/cn/search/%E4%BA%BA%E5%A6%BB': listing([card({ slug: 'ps-134', title: '搜索命中' })]),
   });
-  const items = await source.latest(2, 'release');
-  assert.equal(items.length, 2);
-  assert.equal(items[0].url, '/dm38/zh/abp-123');
-  assert.equal(items[0].title, '示例作品 & 副標題');
-  assert.equal(items[0].cover, 'https://fourhoi.com/abp-123/cover-n.jpg');
-  assert.equal(items[1].url, '/dm51/zh/ssis-456');
-  assert.deepEqual(requests.map((entry) => entry.url), ['https://missav.ai/dm38/zh/release?page=2']);
-  // an unknown channel falls back to the newest feed
-  assert.equal((await source.latest(1, '')).length, 1);
+  assert.equal((await source.latest(1, 'new')).length, 1);
+  assert.equal((await source.latest(2, 'release')).length, 1);
+  assert.equal((await source.search('人妻', 1)).length, 1);
+  assert.deepEqual(Array.from(await source.search('  ', 1)), []);
+  await assert.rejects(source.latest(0, 'new'), /頁碼/);
   assert.deepEqual(requests.map((entry) => entry.url), [
-    'https://missav.ai/dm38/zh/release?page=2',
-    'https://missav.ai/dm38/zh/new',
+    'https://missav.ai/cn/new',
+    'https://missav.ai/cn/release?page=2',
+    'https://missav.ai/cn/search/%E4%BA%BA%E5%A6%BB',
+  ]);
+  assert.deepEqual(Array.from(await source.channels(), (channel) => channel.key).slice(0, 3), ['new', 'release', 'today-hot']);
+});
+
+test('cards come from the thumbnail blocks, so section links are not works', () => {
+  const source = extension();
+  const items = source.cards(listing([
+    card({ slug: 'mina-019', title: '示例作品 &amp; 副標題', duration: '1:58:00' }),
+    card({ slug: 'fc2-ppv-4997591', title: 'FC2 作品', lang: 'cn' }),
+    card({ slug: 'mina-019', title: '重複' }),
+  ]));
+  assert.equal(items.length, 2);
+  assert.deepEqual(Array.from(items, (item) => item.url), ['/cn/mina-019', '/cn/fc2-ppv-4997591']);
+  assert.equal(items[0].title, '示例作品 & 副標題');
+  assert.equal(items[0].cover, 'https://fourhoi.com/mina-019/cover-t.jpg');
+  assert.equal(items[0].update, '1:58:00');
+});
+
+test('work urls accept the rotating dm prefix and refuse section slugs', () => {
+  const source = extension();
+  assert.equal(source.parseWork('/cn/mina-019'), '/cn/mina-019');
+  assert.equal(source.parseWork('/dm539/cn/dvmm-458'), '/cn/dvmm-458');
+  assert.equal(source.parseWork('/cn/fc2-ppv-4997591'), '/cn/fc2-ppv-4997591');
+  assert.equal(source.parseWork('/cn/123456_001'), '/cn/123456_001');
+  for (const path of ['/cn/new', '/cn/genres', '/cn/fc2', '/cn/1pondo', '/ja/siro', '/xx/mina-019', '/cn']) {
+    assert.equal(source.parseWork(path), '', path);
+  }
+  assert.throws(() => source.target('https://example.com/cn/mina-019'), /無效的影片地址/);
+});
+
+test('detail reads the work metadata and offers the quality variants', async () => {
+  const source = extension();
+  source.getSetting = async () => '';
+  routes(source, { '/cn/mina-019': workPage({ title: 'MINA-019 示例作品 - 月野ゆりね' }) });
+  const detail = await source.detail('/cn/mina-019');
+  assert.equal(detail.title, 'MINA-019 示例作品 - 月野ゆりね');
+  assert.equal(detail.cover, 'https://fourhoi.com/mina-019/cover-t.jpg');
+  assert.equal(detail.desc, '示例描述文字');
+  assert.deepEqual(Array.from(detail.episodes[0].urls, (entry) => [entry.name, entry.url]), [
+    ['1080p', '/cn/mina-019#1080p'],
+    ['720p', '/cn/mina-019#720p'],
+    ['預設', '/cn/mina-019'],
   ]);
 });
 
-test('search encodes the keyword and rejects empty input', async () => {
+test('streams are rebuilt from the uuid the page prints, honouring the requested quality', async () => {
   const source = extension();
   source.getSetting = async () => '';
-  const requests = routes(source, {
-    '/dm38/zh/search/%E7%A4%BA%E4%BE%8B%20ABP': listing([card({ slug: 'abp-123', title: '示例作品' })]),
+  routes(source, { '/cn/mina-019': workPage({}) });
+
+  const preset = await source.watch('/cn/mina-019');
+  assert.equal(preset.type, 'hls');
+  assert.equal(preset.url, `https://surrit.com/${uuid}/source842.m3u8`);
+  assert.equal(preset.headers.Referer, 'https://missav.ai/');
+  assert.equal(preset.headers.Cookie, undefined);
+
+  const best = await source.watch('/cn/mina-019#1080p');
+  assert.equal(best.url, `https://surrit.com/${uuid}/1080p/video.m3u8`);
+  const smaller = await source.watch('/cn/mina-019#720p');
+  assert.equal(smaller.url, `https://surrit.com/${uuid}/720p/video.m3u8`);
+
+  const withCookie = extension();
+  withCookie.getSetting = async (key) => (key === 'stream_cookie' ? 'cf_clearance=stream' : '');
+  routes(withCookie, { '/cn/mina-019': workPage({}) });
+  const guarded = await withCookie.watch('/cn/mina-019');
+  assert.equal(guarded.headers.Cookie, 'cf_clearance=stream');
+});
+
+test('watch falls back to an explicit playlist and reports pages without one', async () => {
+  const source = extension();
+  source.getSetting = async () => '';
+  routes(source, {
+    '/cn/dvmm-458': `<!doctype html><html><body><video data-src="https:\\/\\/cdn.example.com\\/dvmm-458\\/index.m3u8"></video></body></html>`,
   });
-  assert.equal((await source.search('  示例 ABP  ', 1)).length, 1);
-  assert.deepEqual(Array.from(await source.search('   ', 1)), []);
-  await assert.rejects(source.search('示例', 0), /頁碼/);
-  assert.deepEqual(requests.map((entry) => entry.url), ['https://missav.ai/dm38/zh/search/%E7%A4%BA%E4%BE%8B%20ABP']);
+  const direct = await source.watch('/cn/dvmm-458');
+  assert.equal(direct.url, 'https://cdn.example.com/dvmm-458/index.m3u8');
+
+  const empty = extension();
+  empty.getSetting = async () => '';
+  routes(empty, { '/cn/ps-134': workPage({ stream: false }) });
+  await assert.rejects(empty.watch('/cn/ps-134'), /找不到播放地址|Cookie/);
 });
 
-test('detail reads the video page metadata', async () => {
+test('a challenge page during a read explains how to refresh the session', async () => {
   const source = extension();
   source.getSetting = async () => '';
-  routes(source, { '/dm38/zh/abp-123': videoPage({ title: 'ABP-123 示例標題' }) });
-  const detail = await source.detail('/dm38/zh/abp-123');
-  assert.equal(detail.title, 'ABP-123 示例標題');
-  assert.equal(detail.cover, 'https://fourhoi.com/abp-123/cover-n.jpg');
-  assert.equal(detail.desc, '示例描述文字');
-  assert.equal(detail.episodes[0].urls[0].url, '/dm38/zh/abp-123');
-});
-
-test('watch returns the embedded playlist with a referer, preferring the master one', async () => {
-  const source = extension();
-  source.getSetting = async () => '';
-  const page = videoPage({ stream: 'https://surrit.com/1c2e-uuid/1080p/video.m3u8' })
-    .replace('</body>', '<script>var sample = "https://surrit.com/1c2e-uuid/720p/video.m3u8";</script></body>');
-  routes(source, { '/dm38/zh/abp-123': page });
-  const stream = await source.watch('/dm38/zh/abp-123');
-  assert.equal(stream.type, 'hls');
-  assert.equal(stream.url, 'https://surrit.com/1c2e-uuid/1080p/video.m3u8');
-  assert.equal(stream.headers.Referer, 'https://missav.ai/');
-
-  const noStream = extension();
-  noStream.getSetting = async () => '';
-  routes(noStream, { '/dm38/zh/abp-123': '<html><body><h1>沒有播放器</h1></body></html>' });
-  await assert.rejects(noStream.watch('/dm38/zh/abp-123'), /Cookie 過期|沒有內嵌播放地址/);
-});
-
-test('work urls are validated before any request is made', async () => {
-  const source = extension();
-  source.request = async () => { throw new Error('should not be called'); };
-  for (const url of ['https://example.com/dm38/zh/abp-123', '/pages/new', '', '/dm38/zh']) {
-    assert.throws(() => source.target(url), /無效的影片地址|無法解析影片地址/);
-  }
-  assert.deepEqual(JSON.parse(JSON.stringify(source.target('/dm51/zh/ssis-456'))), { path: '/dm51/zh/ssis-456', slug: 'ssis-456' });
-});
-
-test('a challenge page during a read explains how to refresh the cookie', async () => {
-  const source = extension();
-  source.getSetting = async () => '';
-  routes(source, { '/dm38/zh/new': challengePage });
+  routes(source, { '/cn/new': challengePage });
   await assert.rejects(source.latest(1, 'new'), /Cloudflare 驗證頁|Cookie/);
 });
 
-test('the entry resolution also picks the host line prefix', async () => {
-  const source = extension();
-  source._site = '';
-  source.getSetting = async () => '';
-  source.request = async (url) => {
-    if (url === 'https://missav.ai/') {
-      return '<html><body><a href="/dm51/ja/abp-123">work</a><a href="/dm51/ja/new">new</a></body></html>';
-    }
-    if (url === 'https://missav.ai/dm51/ja/new') return listing([card({ slug: 'abp-123', title: '示例作品', dm: 'dm51' })]);
-    throw new Error('Unexpected request: ' + url);
-  };
-  assert.equal(await source.entry(), 'https://missav.ai');
-  assert.equal(source.line(), 'dm51/ja');
-  const items = await source.latest(1, '');
-  assert.equal(items.length, 1);
-  // the feed url used the resolved line (dm51/ja), the card keeps its own link
-  assert.equal(items[0].url, '/dm51/zh/abp-123');
-});
-
-test('load registers the three settings even without a settings ui', async () => {
+test('load registers the five settings even without a settings ui', async () => {
   const source = extension();
   const registered = [];
   source.registerSetting = async (setting) => { registered.push(setting.key); };
   source.getSetting = async () => '';
-  source.request = async () => '<html><body><a href="/dm38/zh/abp-123">work</a></body></html>';
+  source.request = async () => listing([card({})]);
   await source.load();
-  assert.deepEqual(registered, ['cookie', 'user_agent', 'host']);
+  assert.deepEqual(registered, ['cookie', 'user_agent', 'stream_cookie', 'language', 'host']);
 });

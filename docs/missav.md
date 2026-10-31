@@ -1,59 +1,61 @@
-# MissAV v1.0.0
+# MissAV v1.1.0
 
-2026-10-31 核对 `missav.ai` 及其镜像，完成单文件插件。只读取公开页面，不登录、不写入、不调用广告或统计接口。
+2026-10-31 用真实会话核对 `missav.ai`，完成单文件插件。只读取公开页面，不登录、不写入、不调用广告或统计接口。
 
 ## 前提：站点由 Cloudflare 挑战保护
 
-实测结论（同一台机器、直连与走代理各测一次）：
-
 | 请求 | 结果 |
 | --- | --- |
-| `/`、`/en`、`/dm38/en`、`/dm38/zh`、`/api/…`、`/search/…` | 403 `Just a moment...`（Cloudflare 托管挑战） |
-| `/sitemap.xml` | 200，可读（只是 URL 清单，519 个 `sitemap_items_N.xml` 分片，没有视频元数据与播放地址） |
-| 通过 Jina Reader 抓同一页面 | 同样拿到挑战页 |
-| 浏览器（已通过验证） | 正常 |
+| 不带会话访问 `/`、`/cn/new`、`/api/…` | 403 `Just a moment...` |
+| `/sitemap.xml` | 200（只是 URL 清单，没有播放地址） |
+| 带浏览器 Cookie（`cf_clearance=…`）+ 同浏览器 UA | **200**，页面完整 |
 
-也就是说：页面、接口和播放地址（`surrit.com/<uuid>/…/video.m3u8`，uuid 只存在于视频页）都拿不到，除非请求本身带着**已经通过挑战的会话**。非 JS 客户端（node、python、本体的 dart 客户端）都无法自行完成挑战。
+实测要点（同一台机器逐项对比）：
 
-### 插件怎么处理
+- **必须写成 Cookie 对**。只贴令牌值（`Chbng…`）→ 403；写成 `cf_clearance=Chbng…` → 200。插件会自动补上缺失的 `cf_clearance=` 名称，也接受整段 Cookie 和 DevTools 的「Copy as cURL」整行。
+- **UA 必须与通过验证的浏览器一致**。同一个令牌换成 Windows UA → 403；换回原 Android UA → 200。
+- `cf_clearance` 与客户端地址绑定，有效期数小时到数天，过期后需要重新复制。
 
-1. **设置里填浏览器的 Cookie 与 UA**（`cookie`、`user_agent`）。插件把这两项加到每个请求上；`cf_clearance` 与 UA、客户端 IP 绑定，所以 UA 必须与复制 Cookie 的浏览器一致。
-2. **入口自动解析**：依次尝试 `missav.ai`、`missav.ws`、`missav.live`，用首页是否返回挑战页来判断可用性；命中后连「线路前缀」一起记录（站点 URL 形如 `/dm38/zh/…`，不同域名会变成 `/dm19/ja` 这类，不能写死）。
-3. 读取时若再次遇到挑战页，报错会直接说明 Cookie 已过期（`cf_clearance` 通常只有效数小时到数天）以及重新复制的方法。
+## 站点结构（2026-10-31 实测）
 
-获取 Cookie 的步骤：浏览器打开 missav 并通过验证 → F12 → Application → Cookies → 复制整段（至少包含 `cf_clearance`）；Network 里随便点一个请求，从 Request Headers 复制 `User-Agent`。两者一起填进插件设置。
+| 能力 | 实现方式 |
+| --- | --- |
+| 语言入口 | `/<lang>`（cn / en / ja / ko …），站点会 302 到带 `dm<N>` 前缀的等价地址 |
+| 列表 | `/<lang>/new`、`/release`、`/today-hot`、`/weekly-hot`、`/monthly-hot`、`/chinese-subtitle`、`/english-subtitle`、`/uncensored-leak`，分页 `?page=N` |
+| 搜索 | `/<lang>/search/<关键词>`，分页 `?page=N` |
+| 作品页 | `/<lang>/<番号>`（链接有时带轮换的 `/dm<N>` 前缀，两种等价） |
+| 列表卡片 | `div.thumbnail.group`：`a[href]` 指向作品、`img.lozad` 的 `data-src` 是封面（`fourhoi.com/<番号>/cover-t.jpg`）、`alt` 是标题、右下角 `span` 是时长 |
+| 详情 | `og:title` / `og:image`（`cover-n.jpg`）/ `og:description`，`<h1>` 兜底 |
+| 播放 | 页面用打包字典拼装 surrit 地址；uuid 直接印在缩略图条（`surrit.com/<uuid>/seek/_0.jpg`），据此还原 `https://surrit.com/<uuid>/1080p|720p/video.m3u8` 与页面默认的 `source842.m3u8` |
 
 ## 已支持
 
-- 2 个列表入口：最新（`/<line>/new`）、發售（`/<line>/release`），分页 `?page=N`。
-- 关键词搜索：`/<line>/search/<关键词>`，分页 `?page=N`。
-- 详情：标题、封面、简介（优先 `og:` 元数据，缺省回退 `<h1>`）。
-- 播放：从视频页里取第一个 HLS 地址（优先 `video.m3u8` / `playlist.m3u8` 主清单），带 `Referer` 返回；同一页面里出现的多个分档按主清单优先排序。
-- 解析容错：列表卡片按「工作页 URL 形状 + 缩略图」识别，不依赖具体类名；`genres`、`actresses`、`search` 这类站点栏目会被排除，不会当成作品。
-- 读取节流：请求串行且间隔不小于 300 毫秒，页面结果缓存 30 秒。
+- 8 个列表入口 + 关键词搜索，分页。
+- 列表卡片：标题、封面、时长。
+- 详情：标题、封面、简介；目录按画质列出 **1080p / 720p / 預設** 三档，某一档不可用时可换另一档播放。
+- 播放：从作品页还原 surrit 播放列表地址，带 `Referer` 返回；若播放域名单独要求验证，可在设置里填该域名的 Cookie（`stream_cookie`）。
+- 设置项：`cookie`（浏览器 Cookie）、`user_agent`（同浏览器 UA）、`stream_cookie`（播放域名 Cookie，可空）、`language`（默认 `cn`）、`host`（可选入口覆盖）。
+- 入口自动解析：`missav.ai` → `missav.ws` → `missav.live`，以「`/<lang>` 不是挑战页且含卡片」为可用判据。
+- 读取节流：请求串行且间隔不小于 300 毫秒，页面缓存 30 秒。
 
-## 尚未支持
+## 未完成 / 已知限制
 
-- 分类（类型/演员/片商）：需要栏目页的实际结构，当前只在拿到真实页面后再补；列表与搜索已可用。
+- **播放域名 `surrit.com` 有自己的 Cloudflare 策略**：本机用同一会话请求 `source842.m3u8` 返回 403（带/不带 Referer、走代理都一样）。插件能正确还原地址，但该 CDN 是否放行取决于客户端与网络；必要时在设置里填 `stream_cookie`（在浏览器打开该视频后，复制 `surrit.com` 的 `cf_clearance`）。播放器侧（mpv）未在本机验证。
+- 栏目页（演员、片商、类型）未接入；列表/搜索已覆盖日常使用。
 - 站点账号功能（收藏、评论、下载券）不做。
 
 ## 验证
 
-- 新增 12 项离线测试，与项目其余测试合计 123 项通过；覆盖入口家族校验、挑战页识别与提示、入口自动选择、线路前缀解析、Cookie/UA 注入、列表与搜索分页、卡片解析与栏目排除、详情元数据、播放地址选取与 Referer、作品地址校验。
-- 线上部分**未完成**：受 Cloudflare 挑战限制，插件在本机只能复现「挑战页 → 明确提示」的路径，无法验证真实列表/播放。`tools/check_missav.mjs` 已写好，带上浏览器 Cookie 与 UA 即可实测：
-
-```sh
-MISSAV_COOKIE='cf_clearance=…; 其他=…' MISSAV_USER_AGENT='Mozilla/5.0 …' node tools/check_missav.mjs
-```
-
+- 新增 12 项离线测试，与项目其余测试合计 123 项通过；覆盖 Cookie/UA 归一化（含 cURL 粘贴）、入口家族与挑战回退、语言根探测、列表/搜索路径与分页、卡片块解析（栏目链接不会被当作品）、`dm` 前缀与番号校验、详情元数据与三档画质、uuid 还原与画质选择、显式 m3u8 兜底、挑战页提示、设置注册。
+- 线上实测（`node tools/check_missav.mjs`，带真实会话，6 次请求）：入口 `https://missav.ai`、语言 `cn`、8 个分类；最新第 1、2 页各 12 项；發售 12 项；搜索「成熟女性群交射精派对」命中 1 项；详情标题 `MINA-019 成熟女性群交射精派对 月野友音 - 月野ゆりね`、封面 `fourhoi.com/mina-019/cover-n.jpg`；播放地址还原为 `surrit.com/e0258f43-…/source842.m3u8`，该域名在本机返回 403（记录为“播放域名拒绝了此客户端”）。
 - 仓库索引生成与脚本大小、SHA-256 检查通过。
 
 复测：
 
 ```sh
 node --test tests/missav_test.mjs
-MISSAV_COOKIE=… MISSAV_USER_AGENT=… node tools/check_missav.mjs
+MISSAV_COOKIE='cf_clearance=…; 其他=…' MISSAV_USER_AGENT='与浏览器一致' node tools/check_missav.mjs
 python tools/build_repository.py
 ```
 
-联网测试独立于 CI，不把页面或播放地址保存到仓库；离线测试使用原创占位 HTML，只沿用站点 URL 形状与元数据字段名。站点结构、挑战策略与播放地址都可能变化，实际结果以设备测试为准。
+联网测试独立于 CI，不把页面、Cookie 或播放地址保存到仓库；离线测试使用原创占位 HTML，只沿用站点 URL 形状、类名与元数据字段名。站点结构、挑战策略与 CDN 策略都可能变化，实际结果以设备测试为准。
