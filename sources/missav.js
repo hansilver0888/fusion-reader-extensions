@@ -1,6 +1,6 @@
 ﻿// ==MiruExtension==
 // @name         MissAV
-// @version      v1.1.5
+// @version      v1.1.6
 // @author       FusionReader
 // @lang         zh-tw
 // @license      MIT
@@ -149,39 +149,76 @@ export default class extends Extension {
     }
   }
 
-  // One field is often enough: "cookie: … ua: …", a "Copy as cURL" line and a
-  // bare cf_clearance value are all accepted, and the user agent is pulled out
-  // when it was pasted together with the cookie.
+  // One field is often enough. Accepted shapes:
+  //   * "cookie: … ua: …" (a single line the user assembles by hand)
+  //   * a DevTools "Copy as cURL" command, which passes the cookie either as
+  //     `-b '…'` / `--cookie '…'` or as `-H 'cookie: …'`, and the agent as
+  //     `-H 'user-agent: …'`, `-A '…'` or `--user-agent '…'`
+  //   * a bare cf_clearance value
   parseCredentials(raw) {
-    let text = (raw === undefined || raw === null ? '' : String(raw)).trim();
+    const text = (raw === undefined || raw === null ? '' : String(raw)).trim();
     if (!text) return { cookie: '', agent: '' };
-    let agent = '';
-    const uaMarker = text.search(/(?:^|[\s;])(?:ua|user-agent)\s*[:=]/i);
-    if (uaMarker >= 0) {
-      const after = text.slice(uaMarker).replace(/^[\s;]*(?:ua|user-agent)\s*[:=]\s*/i, '');
-      const cookieMarker = after.search(/(?:^|[\s;])(?:cookie)\s*[:=]/i);
-      agent = (cookieMarker >= 0 ? after.slice(0, cookieMarker) : after).trim().replace(/^['"]|['"]$/g, '');
-      text = (cookieMarker >= 0 ? after.slice(cookieMarker) : text.slice(0, uaMarker)).trim();
+
+    const pick = (patterns) => {
+      for (const pattern of patterns) {
+        const match = text.match(pattern);
+        if (match && match[1].trim()) return match[1].trim();
+      }
+      return '';
+    };
+
+    let cookie = pick([
+      /-H\s*['"]\s*cookie\s*:\s*([^'"]*)['"]/i,
+      /(?:^|\s)(?:-b|--cookie)\s+['"]([^'"]*)['"]/i,
+    ]);
+    let agent = pick([
+      /-H\s*['"]\s*(?:user-agent|ua)\s*:\s*([^'"]*)['"]/i,
+      /(?:^|\s)(?:-A|--user-agent)\s+['"]([^'"]*)['"]/i,
+    ]);
+
+    // Hand assembled "cookie: … ua: …" pastes.
+    if (!cookie && !agent) {
+      const uaMarker = text.search(/(?:^|[\s;])(?:ua|user-agent)\s*[:=]/i);
+      if (uaMarker >= 0) {
+        const after = text.slice(uaMarker).replace(/^[\s;]*(?:ua|user-agent)\s*[:=]\s*/i, '');
+        const cookieMarker = after.search(/(?:^|[\s;])(?:cookie)\s*[:=]/i);
+        agent = (cookieMarker >= 0 ? after.slice(0, cookieMarker) : after).trim();
+        cookie = (cookieMarker >= 0 ? after.slice(cookieMarker) : text.slice(0, uaMarker)).trim();
+        cookie = cookie.replace(/^[\s;]*cookie\s*[:=]\s*/i, '');
+      } else {
+        cookie = text;
+      }
+    } else if (!cookie) {
+      cookie = '';
     }
-    return { cookie: this.normalizeCookie(text), agent: this.normalizeAgent(agent) };
+    return { cookie: this.normalizeCookie(cookie), agent: this.normalizeAgent(agent) };
   }
 
-  // A bare cf_clearance value is a common paste mistake: the cookie header
-  // needs the name. "Copy as cURL" pastes are accepted as well.
+  // Only "name=value; name=value" belongs in a Cookie header. A bare
+  // cf_clearance value is a common paste mistake, so it gets the missing name;
+  // anything that cannot be a cookie (a whole cURL command, quotes …) becomes
+  // empty instead of being sent and breaking the client's cookie jar.
   normalizeCookie(value) {
     const raw = (value === undefined || value === null ? '' : String(value)).trim();
     if (!raw) return '';
-    const curl = raw.match(/-H\s+['"]cookie:\s*([^'"]+)['"]/i);
-    const text = (curl ? curl[1] : raw.replace(/^cookie:\s*/i, '')).trim();
-    if (/^(?:[A-Za-z0-9_.-]+=[^;]*;?\s*)+$/.test(text)) return text;
-    return `cf_clearance=${text}`;
+    const pairs = /^[A-Za-z0-9_.\-]+=[^;\r\n]*(\s*;\s*[A-Za-z0-9_.\-]+=[^;\r\n]*)*;?$/;
+    const text = raw.replace(/^cookie\s*:\s*/i, '').replace(/\s+/g, ' ').trim();
+    if (pairs.test(text)) return text;
+    if (/^[A-Za-z0-9_\-.]{8,}$/.test(text)) return `cf_clearance=${text}`;
+    return '';
   }
 
   normalizeAgent(value) {
     const raw = (value === undefined || value === null ? '' : String(value)).trim();
     if (!raw) return '';
-    const curl = raw.match(/-H\s+['"]user-agent:\s*([^'"]+)['"]/i);
-    return (curl ? curl[1] : raw.replace(/^user-agent:\s*/i, '')).trim();
+    const text = raw
+      .replace(/^user-agent\s*:\s*/i, '')
+      .replace(/^['"]|['"]$/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!text || /[\r\n]/.test(text)) return '';
+    // A user agent never starts with a shell flag or contains a quote.
+    return /^(?:[A-Za-z0-9]|Mozilla\/)/.test(text) ? text : '';
   }
 
   async session() {
@@ -191,11 +228,16 @@ export default class extends Extension {
     // restart. A challenge error drops it explicitly.
     const fresh = this._session && Date.now() - this._session.time < SESSION_TTL_MS;
     if (!fresh) {
-      const pasted = this.parseCredentials(await this.setting('cookie'));
+      const rawCookie = await this.setting('cookie');
+      const pasted = this.parseCredentials(rawCookie);
       const configuredAgent = this.normalizeAgent(await this.setting('user_agent'));
       this._session = {
         time: Date.now(),
         cookie: pasted.cookie,
+        // a non-empty field that produced no cookie means the paste was not
+        // understood (a whole cURL command, stray characters …)
+        cookieBroken: rawCookie.length > 0 && !pasted.cookie,
+        rawCookieLength: rawCookie.length,
         // the user agent may have been pasted together with the cookie
         agent: configuredAgent || pasted.agent,
         streamCookie: this.normalizeCookie(await this.setting('stream_cookie')),
@@ -289,7 +331,9 @@ export default class extends Extension {
     const session = await this.session();
     const cookie = session.cookie
       ? `Cookie ${session.cookie.length} 字元${session.cookie.indexOf('cf_clearance=') >= 0 ? '·含 cf_clearance' : '·缺少 cf_clearance 名稱'}`
-      : 'Cookie 未設定';
+      : session.cookieBroken
+        ? `Cookie 無法解析（黏貼了 ${session.rawCookieLength} 字元）`
+        : 'Cookie 未設定';
     const agent = session.agent
       ? `UA ${session.agent.length} 字元（${session.agent.slice(0, 24)}…${session.agent.slice(-14)}）`
       : 'UA 未設定（本體預設）';

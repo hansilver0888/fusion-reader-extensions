@@ -72,12 +72,14 @@ function routes(source, map, seen) {
 
 test('cookies are normalised: bare tokens, full strings and cURL pastes', () => {
   const source = extension();
-  assert.equal(source.normalizeCookie('abc-123'), 'cf_clearance=abc-123');
+  assert.equal(source.normalizeCookie('abcd-123'), 'cf_clearance=abcd-123');
   assert.equal(source.normalizeCookie('cf_clearance=abc; __cf_bm=1'), 'cf_clearance=abc; __cf_bm=1');
   assert.equal(source.normalizeCookie('Cookie: cf_clearance=abc'), 'cf_clearance=abc');
-  assert.equal(source.normalizeCookie(`curl 'https://x' -H 'cookie: cf_clearance=abc; x=1' -H 'user-agent: UA'`), 'cf_clearance=abc; x=1');
+  assert.equal(source.parseCredentials(`curl 'https://x' -H 'cookie: cf_clearance=abc; x=1' -H 'user-agent: UA'`).cookie, 'cf_clearance=abc; x=1');
   assert.equal(source.normalizeCookie(''), '');
-  assert.equal(source.normalizeAgent(`curl x -H 'user-agent: Mozilla/5.0 Test'`), 'Mozilla/5.0 Test');
+  // a whole command is not a cookie: sending it breaks the client's cookie jar
+  assert.equal(source.normalizeCookie("curl 'https://x' -b 'a=1' -H 'user-agent: UA'"), '');
+  assert.equal(source.parseCredentials(`curl x -H 'user-agent: Mozilla/5.0 Test'`).agent, 'Mozilla/5.0 Test');
   assert.equal(source.normalizeAgent('Mozilla/5.0 Test'), 'Mozilla/5.0 Test');
 });
 
@@ -107,6 +109,43 @@ test('the agent pasted with the cookie is used when the ua field is empty', asyn
   await source.latest(1, 'new');
   assert.equal(seen[0].headers['User-Agent'], 'Mozilla/5.0 (Linux; Android 16) Chrome/156 Mobile');
   assert.equal(seen[0].headers.cookie, 'cf_clearance=abc');
+});
+
+test('a "Copy as cURL" command yields both the cookie and the user agent', () => {
+  const source = extension();
+  const ua = 'Mozilla/5.0 (Linux; Android 16; Pixel 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Mobile Safari/537.36';
+  const curl = `curl --url 'https://missav.ai/dm285/ja' \\
+  -H 'accept: text/html,application/xhtml+xml' \\
+  -H 'accept-language: en,zh-CN;q=0.9' \\
+  -b '_ga=GA1.1.1323191277.1785593842; user_uuid=529258b1-1a6a-46dd-856c-d14181a2d118; cf_clearance=Ckiz4wPeIzZLr1DkSJcYEbPG1FI3AGj2S96WzngL; XSRF-TOKEN=eyJpdiI6IjRvK0I1dy9sRnl3YkIwQVNaOEkraXc9PSJ9' \\
+  -H 'sec-ch-ua-mobile: ?1' \\
+  -H 'user-agent: ${ua}'`;
+  const parsed = source.parseCredentials(curl);
+  assert.ok(parsed.cookie.includes('cf_clearance=Ckiz4wPeIzZLr1DkSJcYEbPG1FI3AGj2S96WzngL'), parsed.cookie);
+  assert.ok(parsed.cookie.includes('user_uuid=529258b1'), parsed.cookie);
+  assert.ok(!parsed.cookie.includes('curl'), parsed.cookie);
+  assert.ok(!parsed.cookie.includes('-H'), parsed.cookie);
+  assert.equal(parsed.agent, ua);
+
+  // the other cURL dialect: -H 'cookie: …' plus -A
+  const variant = source.parseCredentials(`curl 'https://missav.ai/cn' -H 'cookie: cf_clearance=abc12345; a=1' -A 'Mozilla/5.0 Test'`);
+  assert.equal(variant.cookie, 'cf_clearance=abc12345; a=1');
+  assert.equal(variant.agent, 'Mozilla/5.0 Test');
+});
+
+test('an unparsable paste is reported instead of being sent as a cookie', async () => {
+  const source = extension();
+  source.getSetting = async (key) => (key === 'cookie' ? 'curl --url x --header "a: b" ' + 'z'.repeat(4000) : '');
+  const seen = [];
+  source.request = async (url, options) => {
+    seen.push(options);
+    return challengePage;
+  };
+  const session = await source.session();
+  assert.equal(session.cookie, '');
+  assert.equal(session.cookieBroken, true);
+  await assert.rejects(source.latest(1, 'new'), /Cookie 無法解析（黏貼了 \d+ 字元）/);
+  assert.equal(seen[0].headers.cookie, undefined);
 });
 
 test('entries are limited to the missav families and the probe uses the language root', async () => {
