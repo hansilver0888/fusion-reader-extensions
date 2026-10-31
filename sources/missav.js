@@ -1,6 +1,6 @@
-// ==MiruExtension==
+﻿// ==MiruExtension==
 // @name         MissAV
-// @version      v1.1.2
+// @version      v1.1.3
 // @author       FusionReader
 // @lang         zh-tw
 // @license      MIT
@@ -58,6 +58,9 @@ const RESERVED_SLUGS = [
 // whichever host answers.
 const PAGE_GAP_MS = 300;
 const PAGE_CACHE_MS = 30000;
+// A saved cookie has to apply without restarting the app: settings are re-read
+// once the snapshot is a few seconds old.
+const SESSION_TTL_MS = 5000;
 // cf_clearance is bound to the user agent that solved the challenge. When the
 // settings only carry a cookie, these are tried in order and the first that is
 // accepted is stored back into the settings.
@@ -183,10 +186,15 @@ export default class extends Extension {
 
   async session() {
     this.state();
-    if (!this._session) {
+    // Settings can be edited while the plugin instance stays loaded, so the
+    // snapshot is short lived: a saved cookie has to take effect without an app
+    // restart. A challenge error drops it explicitly.
+    const fresh = this._session && Date.now() - this._session.time < SESSION_TTL_MS;
+    if (!fresh) {
       const pasted = this.parseCredentials(await this.setting('cookie'));
       const configuredAgent = this.normalizeAgent(await this.setting('user_agent'));
       this._session = {
+        time: Date.now(),
         cookie: pasted.cookie,
         // the user agent may have been pasted together with the cookie
         agent: configuredAgent || pasted.agent,
@@ -574,10 +582,13 @@ export default class extends Extension {
     const body = typeof text === 'string' ? text : JSON.stringify(text);
     if (this.challenged(body)) {
       const session = await this.session();
+      // The next attempt must re-read the settings: the user may have just
+      // pasted a fresh clearance.
+      this._session = null;
       throw new Error(
         'MissAV 回傳 Cloudflare 驗證頁（Just a moment...）。\n'
-        + `本次送出：Cookie ${session.cookie ? `（${session.cookie.length} 字元）` : '未設定'}，`
-        + `UA ${session.agent ? '（自訂）' : '（本體預設）'}。\n`
+        + `本次送出：Cookie ${session.cookie ? `（${session.cookie.length} 字元，${session.cookie.indexOf('cf_clearance=') >= 0 ? '含 cf_clearance' : '缺少 cf_clearance 名稱'}）` : '未設定'}，`
+        + `UA ${session.agent ? `（${session.agent.slice(0, 42)}…）` : '（本體預設）'}。\n`
         + '請在瀏覽器打開 missav 通過驗證，把整段 Cookie（含 cf_clearance）與同一個瀏覽器的 UA 填進插件設置；'
         + 'Cookie 過期後需要重新複製。'
       );

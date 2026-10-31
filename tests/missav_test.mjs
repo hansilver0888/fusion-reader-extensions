@@ -6,8 +6,11 @@ import { test } from 'node:test';
 // The frames below repeat the shape the site ships (checked 2026-10-31):
 // `div.thumbnail.group` cards, `/<lang>/<code>` work urls, the lazy cover on
 // fourhoi and a surrit uuid printed in the thumbnail strip.
-function extension() {
-  const context = vm.createContext({ sendMessage() {}, Date });
+function extension(clock) {
+  const context = vm.createContext({
+    sendMessage() {},
+    Date: clock ? class extends Date { static now() { return clock.now; } } : Date,
+  });
   vm.runInContext(fs.readFileSync(new URL('../fixtures/runtime.js', import.meta.url), 'utf8'), context);
   vm.runInContext(fs.readFileSync(new URL('../sources/missav.js', import.meta.url), 'utf8')
     .replace('export default class', 'globalThis.Source = class'), context);
@@ -288,6 +291,44 @@ test('a challenge page during a read explains how to refresh the session', async
   source.getSetting = async () => '';
   routes(source, { '/cn/new': challengePage });
   await assert.rejects(source.latest(1, 'new'), /Cloudflare 驗證頁|Cookie/);
+});
+
+test('a cookie saved after the plugin loaded is used without an app restart', async () => {
+  const clock = { now: 1000 };
+  const source = extension(clock);
+  let cookie = '';
+  source.getSetting = async (key) => (key === 'cookie' ? cookie : '');
+  const seen = [];
+  routes(source, {
+    '/cn/new': listing([card({})]),
+    '/cn/release': listing([card({ slug: 'dvmm-458', title: '第二部' })]),
+  }, seen);
+
+  await source.latest(1, 'new');
+  assert.equal(seen[0].headers.cookie, undefined);
+
+  // the user saves the settings while the app keeps running
+  cookie = 'cf_clearance=fresh';
+  clock.now += 6000;
+  await source.latest(1, 'release');
+  assert.equal(seen[1].headers.cookie, 'cf_clearance=fresh');
+  assert.equal(seen[1].headers.Cookie, 'cf_clearance=fresh');
+});
+
+test('a challenged read drops the snapshot so the next attempt re-reads the settings', async () => {
+  const source = extension();
+  let cookie = 'cf_clearance=old';
+  source.getSetting = async (key) => (key === 'cookie' ? cookie : '');
+  let attempts = 0;
+  source.request = async (url, options) => {
+    attempts++;
+    if (attempts === 1) return challengePage;
+    assert.equal((options.headers || {}).cookie, 'cf_clearance=old');
+    return listing([card({})]);
+  };
+  await assert.rejects(source.latest(1, 'new'), /Cloudflare 驗證頁/);
+  assert.equal(source._session, null);
+  assert.equal((await source.latest(1, 'new')).length, 1);
 });
 
 test('load registers the five settings even without a settings ui', async () => {
