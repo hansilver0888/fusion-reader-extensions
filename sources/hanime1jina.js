@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         Hanime1 動畫（中轉）
-// @version      v1.0.0
+// @version      v1.1.0
 // @author       FusionReader
 // @lang         zh-tw
 // @license      MIT
@@ -21,17 +21,36 @@
 // is not behind that edge, so playback stays direct (verified: 206 + ftyp).
 //
 //   reader request : https://r.jina.ai/<target url>
-//                    with `x-return-format: html` (without it the reader
-//                    rewrites the page into markdown and drops the player)
+//                    `x-return-format: html` — without it the reader rewrites the
+//                    page into markdown and drops the player;
+//                    `x-target-selector` — only that subtree is returned, which is
+//                    what keeps the free tier usable (see the numbers below);
+//                    `Authorization: Bearer …` — optional key, raises the limit to
+//                    the key's quota instead of the per-ip one.
 //   listing card   : div.video-item-container[title] > a.video-link[href]
 //                    > img.main-thumb  (thumbnails are vdownload urls)
 //   video page     : <video id="player"> with <source src=… size=720|480|1080>
-// The pages are cached for a while because every hop through the reader costs a
-// request against a free public service.
+//
+// Token cost per request measured 2026-11-01 (the reader bills output tokens):
+//   home page, whole document          63,309
+//   home page, div.video-item-container 19,404   (-69%)
+//   video page, whole document        104,059
+//   video page, video + og: meta          727   (-99.3%)
+// The free tier is 20 requests/minute per ip (500 with a free key), so the
+// selectors buy headroom as much as they buy speed.
 
 const SITE = 'https://hanime1.me';
 const READER = 'https://r.jina.ai/';
 const MEDIA_HOSTS = /^(?:[a-z0-9-]+\.)*(?:hembed\.com|hanime\.tv|hembed\.tv)$/i;
+// what each kind of page needs. The genre grid is the exception: trimming to
+// `div.home-rows-videos-div` drops the wrapping <a>, so that page is read whole
+// (with a fresh render, see `reader`), and only home/search are trimmed.
+const SELECTORS = {
+  list: 'div.video-item-container',
+  watch: 'video#player, meta[property^="og:"], title',
+};
+// pages whose reader cache came back without anchors and need x-no-cache
+const FRESH_RENDER_PATTERN = /\/search\?genre=/i;
 const SECTIONS = [
   { title: '首頁', path: '/' },
   { title: '裏番', path: '/search?genre=%E8%A3%8F%E7%95%AA' },
@@ -49,12 +68,40 @@ export default class extends Extension {
       this._inflight = new Map();
       this._lastRequest = 0;
       this._queue = Promise.resolve();
+      this._apiKey = null;
     }
     return this;
   }
 
   async load() {
     this.state();
+    try {
+      await this.registerSetting({
+        key: 'api_key',
+        title: 'Jina API Key',
+        type: 'password',
+        description: '可選。留空走免費額度（每 IP 每分鐘 20 次）；填入後限制改按 Key 計算（免費 Key 500 次/分鐘），多設備共用同一 IP 時建議填。在 jina.ai/api-dashboard 免費取得。',
+        defaultValue: '',
+      });
+    } catch (error) {
+      // older runtimes without a settings ui still work with the free tier
+    }
+  }
+
+  async apiKey() {
+    this.state();
+    if (this._apiKey === null) {
+      let value = '';
+      try {
+        const raw = await this.getSetting('api_key');
+        value = raw === undefined || raw === null ? '' : String(raw).trim();
+      } catch (error) {
+        value = '';
+      }
+      // accept a full "Bearer …" paste as well as the bare key
+      this._apiKey = value.replace(/^Bearer\s+/i, '');
+    }
+    return this._apiKey;
   }
 
   // ---------- helpers ----------
@@ -128,46 +175,75 @@ export default class extends Extension {
   }
 
   // Every page goes through the reader: it is the only route that passes the
-  // site's edge without a browser of our own.
-  async reader(target) {
+  // site's edge without a browser of our own. `selector` trims the response to
+  // the subtree the caller needs, which is what keeps token use down.
+  //
+  // `noCache` matters: the reader keeps its own copy of a url and that copy can
+  // be broken (a cached genre page came back with every <a> stripped, so the
+  // grid had titles but no links). Asking for a fresh render fixes it, which is
+  // why a listing that parses to nothing is retried once with the cache bypassed.
+  async reader(target, selector, noCache) {
     const absolute = /^https?:\/\//i.test(target) ? target : `${SITE}${target}`;
+    const key = await this.apiKey();
+    const headers = {
+      Accept: '*/*',
+      'x-return-format': 'html',
+      'x-no-cache': noCache ? 'true' : 'false',
+      'x-timeout': '45',
+    };
+    if (selector) headers['x-target-selector'] = selector;
+    if (key) headers.Authorization = `Bearer ${key}`;
+
     const body = await this.request1(`${READER}${absolute}`, {
-      headers: {
-        Accept: '*/*',
-        'x-return-format': 'html',
-        'x-no-cache': 'false',
-      },
+      headers,
       allowErrorStatus: true,
     });
     if (/^\s*(?:\[|#|\{\s*"?(?:error|message))/i.test(body) && body.length < 400) {
       throw new Error(`中轉服務沒有返回頁面：${body.slice(0, 160)}`);
     }
-    if (!/<html|<body|<div/i.test(body)) {
+    // a trimmed single element is fine: it need not be a whole document
+    if (!/<html|<body|<div|<video|<img|<a|og:/i.test(body)) {
       throw new Error('中轉服務返回的內容不是網頁，可能已達免費額度上限，請稍後重試。');
     }
     return body;
   }
 
-  async page(path) {
+  // The cache key includes the selector: the same url read for a listing and for
+  // a player carries different subtrees.
+  async page(path, selector, noCache) {
     this.state();
-    const cached = this._pages.get(path);
+    const key = `${noCache ? '!' : ''}${selector || ''}|${path}`;
+    const cached = this._pages.get(key);
     if (cached && Date.now() - cached.time < PAGE_CACHE_MS) return cached.body;
-    const running = this._inflight.get(path);
+    const running = this._inflight.get(key);
     if (running) return running;
 
-    const task = this.reader(path).then(
+    const task = this.reader(path, selector, noCache).then(
       (body) => {
-        this._pages.set(path, { time: Date.now(), body });
-        this._inflight.delete(path);
+        this._pages.set(key, { time: Date.now(), body });
+        this._inflight.delete(key);
         return body;
       },
       (error) => {
-        this._inflight.delete(path);
+        this._inflight.delete(key);
         throw error;
       }
     );
-    this._inflight.set(path, task);
+    this._inflight.set(key, task);
     return task;
+  }
+
+  // A listing read with the reader's own cache can come back with its anchors
+  // stripped; the genre pages do so reliably, so they are read fresh, and any
+  // other listing that parses to nothing is retried once with the cache bypassed.
+  async listingPage(path, selector) {
+    const needsFresh = FRESH_RENDER_PATTERN.test(path);
+    const useSelector = needsFresh ? '' : selector;
+    let html = await this.page(path, useSelector, needsFresh);
+    if (this.cards(html).length) return html;
+    const fresh = await this.reader(path, '', true);
+    this._pages.set(`|${path}`, { time: Date.now(), body: fresh });
+    return fresh;
   }
 
   // ---------- channels / listings ----------
@@ -183,7 +259,7 @@ export default class extends Extension {
     const section = SECTIONS[index] || SECTIONS[0];
     const separator = section.path.indexOf('?') >= 0 ? '&' : '?';
     const path = `${section.path}${number > 1 ? `${separator}page=${number}` : ''}`;
-    return this.cards(await this.page(path));
+    return this.cards(await this.listingPage(path, SELECTORS.list));
   }
 
   async search(kw, page) {
@@ -191,7 +267,7 @@ export default class extends Extension {
     if (!keyword) return [];
     const number = this.pageNumber(page);
     const path = `/search?query=${encodeURIComponent(keyword)}${number > 1 ? `&page=${number}` : ''}`;
-    return this.cards(await this.page(path));
+    return this.cards(await this.listingPage(path, SELECTORS.list));
   }
 
   // Two card shapes ship on the site:
@@ -268,7 +344,7 @@ export default class extends Extension {
 
   async detail(url) {
     const target = this.target(url);
-    const html = await this.page(target.path);
+    const html = await this.page(target.path, SELECTORS.watch);
     // "<title> - H動漫/裏番/線上看 - Hanime1.me" is the site's suffix, not the name
     const stripSiteName = (value) => this.textOf(value)
       .replace(/\s*[-|]\s*(?:H動漫|Hanime1(?:\.me)?).*$/i, '')
@@ -290,7 +366,7 @@ export default class extends Extension {
 
   async watch(url) {
     const target = this.target(url);
-    const html = await this.page(target.path);
+    const html = await this.page(target.path, SELECTORS.watch);
     const sources = this.videoSources(html);
     if (!sources.length) {
       if (/需要\s*(?:登入|註冊)|僅限\s*(?:會員|Premium)|登入後/.test(html)) {

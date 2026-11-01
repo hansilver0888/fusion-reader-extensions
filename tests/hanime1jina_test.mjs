@@ -75,6 +75,62 @@ test('requests go through the reader with the html return format', async () => {
   assert.equal(requests.length, 1);
   assert.equal(requests[0].url, 'https://r.jina.ai/https://hanime1.me/');
   assert.equal(requests[0].options.headers['x-return-format'], 'html');
+  // the listing is trimmed to its cards to save reader tokens
+  assert.equal(requests[0].options.headers['x-target-selector'], 'div.video-item-container');
+  assert.equal(requests[0].options.headers['x-no-cache'], 'false');
+});
+
+test('the api key setting becomes a bearer header when it is filled in', async () => {
+  const source = extension();
+  const requests = routes(source, () => listing([richCard({})]));
+  source.getSetting = async (key) => (key === 'api_key' ? 'Bearer jina_abc123' : '');
+  await source.latest(1, '0');
+  assert.equal(requests[0].options.headers.Authorization, 'Bearer jina_abc123');
+
+  const anonymous = extension();
+  const anonymousRequests = routes(anonymous, () => listing([richCard({})]));
+  await anonymous.latest(1, '0');
+  assert.equal(anonymousRequests[0].options.headers.Authorization, undefined);
+
+  const bare = extension();
+  const bareRequests = routes(bare, () => listing([richCard({})]));
+  bare.getSetting = async (key) => (key === 'api_key' ? '  jina_xyz  ' : '');
+  await bare.latest(1, '0');
+  assert.equal(bareRequests[0].options.headers.Authorization, 'Bearer jina_xyz');
+});
+
+test('the video page is trimmed to the player and its metadata', async () => {
+  const source = extension();
+  const requests = routes(source, () => videoPage({}));
+  await source.watch('/watch?v=408948');
+  assert.equal(requests[0].options.headers['x-target-selector'], 'video#player, meta[property^="og:"], title');
+});
+
+test('a genre page is read whole and without the reader cache', async () => {
+  const source = extension();
+  const requests = routes(source, () => listing([gridCard({})]));
+  const items = await source.latest(1, '1');
+  assert.equal(items.length, 1);
+  assert.equal(items[0].url, 'https://hanime1.me/watch?v=408323');
+  // trimming a genre page drops the wrapping anchor, so no selector is sent
+  assert.equal(requests[0].options.headers['x-target-selector'], undefined);
+  assert.equal(requests[0].options.headers['x-no-cache'], 'true');
+});
+
+test('a listing that parses to nothing is retried from a fresh render', async () => {
+  const source = extension();
+  let calls = 0;
+  const requests = routes(source, () => {
+    calls += 1;
+    // first answer: anchors stripped (the reader's broken cache)
+    if (calls === 1) return '<html><body><div class="video-item-container"><div class="video-card-inner"><div class="duration">03:57</div></div></div></body></html>';
+    return listing([richCard({})]);
+  });
+  const items = await source.latest(1, '0');
+  assert.equal(items.length, 1);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].options.headers['x-no-cache'], 'true');
+  assert.equal(requests[1].options.headers['x-target-selector'], undefined);
 });
 
 test('channels build genre and page paths', async () => {

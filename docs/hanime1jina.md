@@ -1,6 +1,50 @@
-# Hanime1 動畫（中轉） v1.0.0
+# Hanime1 動畫（中轉） v1.1.0
 
 2026-11-01 实测，`hanime1` 的**并行版本**：页面走公共读服务中转，视频直链保持直连，因此不配置代理也能在 Windows / iOS / Android 上使用。原 `hanime1` 插件保持不变。
+
+## v1.1.0 新增：API Key、选择器裁剪、缓存修复
+
+### 额度规则（官方文档 + 实测响应头）
+
+限制是 **RPM（每分钟请求）+ TPM（每分钟 token）** 双重，**按 IP 或 API Key 之一**计数：
+
+```
+x-ratelimit-limit: 20, 20;w=60   ← 20 次 / 60 秒
+x-ratelimit-remaining: 19
+x-usage-tokens: 104059           ← 该次请求消耗的 token
+```
+
+| 凭据 | Reader 限制 |
+| --- | --- |
+| 不带 Key | **20 RPM，按访问 IP** |
+| 免费 Key | 500 RPM，按 Key |
+| 付费 / Premium | 500 / 5000 RPM |
+
+**视频流量不计入额度**：只让页面走 `r.jina.ai`，播放地址是 `vdownload.hembed.com` 的直连 mp4（实测 206），与中转无关。只有浏览页面消耗 token：首页约 6.3 万、视频页约 10.4 万。
+
+多设备共用同一公网 IP 时会一起挤 20 RPM，填 Key 即按 Key 计。
+
+### 新增设置项 `api_key`
+
+在 <https://jina.ai/api-dashboard> 免费获取，填入后请求带 `Authorization: Bearer <key>`；接受只贴 Key 或贴整段 `Bearer …`。留空走免费额度。
+
+### 选择器裁剪（省 25%–99% token）
+
+| 页面 | 参数 | token 变化 |
+| --- | --- | --- |
+| 视频页 | `x-target-selector: video#player, meta[property^="og:"], title` | 104,059 → **727**（-99.3%） |
+| 首页 | `x-target-selector: div.video-item-container` | 63,309 → 47,484 |
+| 搜索 | 同上 | 19,404 |
+| 分类页 | **不加选择器** | —— |
+
+分类页必须例外：裁到 `div.home-rows-videos-div` 会把外层 `<a>` 一起剥掉，解析不到链接。
+
+### 中转缓存会返回坏页面
+
+实测分类页的**中转缓存**返回 19,890 字节、`<a>` 全被剥离（41 个标题、0 个链接）；加 `x-no-cache: true` 重新渲染后恢复到 106,350 字节、41 个可用链接。因此：
+
+- 分类页固定带 `x-no-cache: true`
+- 任何列表页如果解析结果为 0 条，自动用 `x-no-cache` 重试一次
 
 ## 为什么需要它
 
@@ -46,7 +90,7 @@ cf-bypass:
 
 ## 验证
 
-- 新增 9 项离线测试，仓库合计 157 项通过；覆盖中转请求头、频道与分页、搜索编码、双卡片结构解析、标题清理、最高画质选择、无源报错、地址校验、非网页响应。
+- 新增 13 项离线测试，仓库合计 161 项通过；覆盖中转请求头、频道与分页、搜索编码、双卡片结构解析、标题清理、最高画质选择、无源报错、地址校验、非网页响应。
 - 线上实测（`node tools/check_hanime1jina.mjs`，4 次插件请求）：
 
 ```
