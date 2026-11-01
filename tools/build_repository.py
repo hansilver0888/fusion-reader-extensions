@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -58,7 +59,7 @@ def build(destination, base_url):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', default=str(ROOT / 'dist'))
-    parser.add_argument('--base-url', default='https://hanyin111.github.io/fusion-reader-extensions/')
+    parser.add_argument('--base-url', default='https://' + os.environ.get('GITHUB_REPOSITORY', 'hansilver0888/fusion-reader-extensions').replace('/', '.github.io/', 1) + '/')
     args = parser.parse_args()
     catalog = build(args.output, args.base_url)
     print(f'Published metadata for {len(catalog["extensions"])} plugins')

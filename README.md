@@ -2,14 +2,20 @@
 
 聚阅的独立来源插件。应用本体：[hanyin111/fusion-reader](https://github.com/hanyin111/fusion-reader)。插件使用跨平台 JavaScript，分发方式参考 Mihon 的独立扩展仓库和 Aidoku 的来源列表；格式为 FusionReader / Miru 脚本，不直接兼容其 APK 或 WASM 插件。
 
-- 插件网页：<https://hanyin111.github.io/fusion-reader-extensions/>
-- 仓库索引：<https://hanyin111.github.io/fusion-reader-extensions/index.json>
+- 插件网页：<https://hansilver0888.github.io/fusion-reader-extensions/>
+- 仓库索引：<https://hansilver0888.github.io/fusion-reader-extensions/index.json>
 
 ## 安装与更新
 
 在聚阅 1.4.0 或更新版本打开「扩展 → 插件仓库」，选择插件安装。1.4.1 起需要先手动填写仓库索引地址。已安装插件会显示更新按钮，也可使用「更新已安装插件」。插件脚本下载并保存到本机，之后启动和离线阅读无需重新下载。升级旧版应用后，可使用「恢复旧版插件」安装原来的来源；原有书架、历史和插件设置保留。
 
 网页可按类型和名称查找，复制仓库地址或单个脚本安装链接。应用也保留 URL 和粘贴脚本安装。
+
+## 哔哩哔哩收藏夹
+
+v0.1.0 需要聚阅 1.4.5 及更新版本。在「扩展」点击来源登录，使用手机哔哩哔哩客户端扫码并确认。登录后「发现 → 动画」显示自己的收藏夹，可切换收藏夹、分页浏览和搜索收藏视频；有分 P 的视频按分集管理。支持清晰度切换、分 P 弹幕、视频评论及评论回复。
+
+登录状态仅保存在当前设备，不随书架备份和云同步传输。无需提供密码；退出来源账号或卸载此插件会清除本机保存的登录状态。只读取当前账号有权限访问的内容。功能边界及验证记录见 [docs/bilibili.md](docs/bilibili.md)。
 
 ## Omofun 动漫
 
