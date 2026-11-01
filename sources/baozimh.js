@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         包子漫畫
-// @version      v1.0.2
+// @version      v1.0.3
 // @author       FusionReader
 // @lang         zh-tw
 // @license      MIT

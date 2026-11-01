@@ -1,4 +1,12 @@
-# 包子漫畫 v1.0.2
+# 包子漫畫 v1.0.3
+
+## v1.0.3 修正
+
+| 问题 | 原因 | 修法 |
+| --- | --- | --- |
+| 章节顺序乱、章节名为空 | 作品页把章节**从新到旧**排列（`chapter_slot` 286 → 0），且同一章会因分卷（`comic_id` 带 `_xxxxxx`）出现两次；部分条目内文是纯文本而非嵌套 `<span>` | 按 `section_slot:chapter_slot` 去重后**升序**输出；标题取内文文本（含纯文本），取不到时回退为「第 N 話」 |
+| 频道标签无法使用：选择日漫/韩漫后所有标签都显示选中且内容不变 | `channels()` 的 `key` 读的是 `section.key`，但分页改造后 `SECTIONS` 只剩 `path`/`paged` 字段，于是 6 个频道的 `key` 全是 `undefined`。本体用 `_channelKey == channel.key` 逐个比对 chip，`undefined == undefined` 让**每个标签都命中**；点击写入的也是 `undefined`，`latest()` 回落到第一个频道 | `channels()` 改用**下标字符串**作 key（`"0"`…`"5"`），与 `latest()` 的解析一致；并加回归测试断言 key 唯一且非空 |
+
 
 2026-11-01 实测 `www.baozimh.com`，完成单文件插件（`@type manga`）。只读取公开页面与图片，不登录、不写入。
 
@@ -8,6 +16,7 @@
 | --- | --- |
 | 列表卡片 | `div.comics-card` > `a.comics-card__poster[href][title]` > `amp-img[src]`（封面 `static-tw.baozimh.com/cover/<slug>.jpg`） |
 | 最近更新 | `/list/new`（**单页**，忽略 `?page`） |
+| 频道 key | `channels()` 的 key 用下标字符串，本体据此判断选中态 |
 | 分类 | `/classify?type=…&region=…&state=…&filter=%2a`，支持 `&page=N` |
 | 搜索 | `/search?q=<关键词>`（单页） |
 | 详情 | `/comic/<slug>`；章节链接为 `/user/page_direct?comic_id=<slug>&section_slot=<s>&chapter_slot=<n>` |
