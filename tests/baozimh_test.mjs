@@ -129,6 +129,10 @@ test('channels page the catalogue but not the update feed', async () => {
   const channels = await source.channels();
   assert.equal(channels.length, 6);
   assert.equal(channels[0].title, '最近更新');
+  // the app compares every chip against this key, so it must be unique and set
+  const keys = Array.from(channels, (channel) => channel.key);
+  assert.equal(new Set(keys).size, keys.length, 'channel keys must be unique');
+  assert.ok(keys.every((key) => typeof key === 'string' && key.length > 0), 'channel keys must not be empty');
 
   await source.latest(1, '0');
   await source.latest(2, '0');
@@ -167,6 +171,45 @@ test('detail reads the metadata and every chapter', async () => {
   assert.equal(detail.episodes[0].urls[0].title, '001話：開端');
   assert.match(detail.episodes[0].urls[0].url, /chapter_slot=0/);
   assert.match(detail.episodes[0].urls[1].url, /chapter_slot=1/);
+});
+
+test('chapters are de-duplicated and ordered by slot', async () => {
+  const source = extension();
+  // the page lists newest first, repeats each chapter for a second volume and
+  // ends with a "latest chapters" block that goes the other way
+  const rows = [
+    { slot: 2, name: '003話：第三' },
+    { slot: 2, name: '003話：第三' },
+    { slot: 1, name: '002話：第二' },
+    { slot: 0, name: '001話：第一' },
+  ].map((chapter) => `<a href="/user/page_direct?comic_id=slug_a&amp;section_slot=0&amp;chapter_slot=${chapter.slot}" class="comics-chapters__item"><div><span>${chapter.name}</span></div></a>`);
+  const latest = [
+    { slot: 0, name: '001話：第一' },
+    { slot: 1, name: '002話：第二' },
+  ].map((chapter) => `<a href="/user/page_direct?comic_id=slug_a_xxxxxx&amp;section_slot=0&amp;chapter_slot=${chapter.slot}" class="comics-chapters__item">${chapter.name}</a>`);
+  const html = `<!doctype html><html><head><meta property="og:title" content="作品A漫畫 - 包子漫畫"></head><body>${rows.join('\n')}${latest.join('\n')}</body></html>`;
+
+  routes(source, () => html);
+  const chapters = (await source.detail('/comic/slug_a')).episodes[0].urls;
+  assert.equal(chapters.length, 3);
+  assert.deepEqual(Array.from(chapters, (chapter) => chapter.title), ['001話：第一', '002話：第二', '003話：第三']);
+  assert.deepEqual(
+    Array.from(chapters, (chapter) => (chapter.url.match(/chapter_slot=(\d+)/) || [])[1]),
+    ['0', '1', '2'],
+  );
+});
+
+test('chapters keep a plain text title and fall back when there is none', async () => {
+  const source = extension();
+  const html = `<!doctype html><html><head><meta property="og:title" content="作品B漫畫 - 包子漫畫"></head><body>
+<a href="/user/page_direct?comic_id=slug_b&amp;section_slot=0&amp;chapter_slot=1">285 大軍撤退</a>
+<a href="/user/page_direct?comic_id=slug_b&amp;section_slot=0&amp;chapter_slot=0"><div><span></span></div></a>
+</body></html>`;
+  routes(source, () => html);
+  const chapters = (await source.detail('/comic/slug_b')).episodes[0].urls;
+  assert.equal(chapters.length, 2);
+  assert.equal(chapters[0].title, '第 1 話');
+  assert.equal(chapters[1].title, '285 大軍撤退');
 });
 
 test('detail refuses a work without chapters', async () => {

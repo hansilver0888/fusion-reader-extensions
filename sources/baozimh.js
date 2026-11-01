@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         包子漫畫
-// @version      v1.0.1
+// @version      v1.0.2
 // @author       FusionReader
 // @lang         zh-tw
 // @license      MIT
@@ -373,8 +373,11 @@ export default class extends Extension {
 
   // ---------- channels / listings ----------
 
+  // The key is the position in SECTIONS: the app matches it against every chip,
+  // so it has to be a unique non-empty string (an undefined key makes all chips
+  // look selected and every click fall back to the first feed).
   async channels() {
-    return SECTIONS.map((section) => ({ title: section.title, key: section.key }));
+    return SECTIONS.map((section, index) => ({ title: section.title, key: String(index) }));
   }
 
   async latest(page, channel) {
@@ -446,21 +449,42 @@ export default class extends Extension {
       || this.coverFor(target.slug);
     const desc = this.textOf(this.meta(html, 'description'));
 
-    // chapters: /user/page_direct?comic_id=<slug>&section_slot=<s>&chapter_slot=<n>
-    const chapters = [];
-    const seen = new Set();
-    const pattern = /<a\b[^>]*href="([^"]*\/user\/page_direct\?[^"]*)"[^>]*>([\s\S]{0,400}?)<\/a>/gi;
+    // Chapters link to /user/page_direct?comic_id=<slug>&section_slot=<s>&chapter_slot=<n>.
+    // The page lists them newest first and the same chapter appears twice (once
+    // per volume, comic_id ending in _xxxxxx), so collect by section/slot and
+    // sort ascending: the app shows the list in the order it is handed over.
+    const bySlot = new Map();
+    const pattern = /<a\b[^>]*href="([^"]*\/user\/page_direct\?[^"]*)"[^>]*>([\s\S]{0,600}?)<\/a>/gi;
     let match;
     while ((match = pattern.exec(html)) !== null) {
       const href = this.decodeEntities(match[1].replace(/&amp;/g, '&'));
-      if (!/chapter_slot=\d+/.test(href) || seen.has(href)) continue;
-      const name = this.textOf(match[2]) || `第 ${chapters.length + 1} 話`;
-      seen.add(href);
-      chapters.push({ title: name, url: href.startsWith('http') ? href : this.absolute(href) });
+      const slotMatch = href.match(/chapter_slot=(\d+)/);
+      if (!slotMatch) continue;
+      const section = (href.match(/section_slot=(\d+)/) || [])[1] || '0';
+      const slot = parseInt(slotMatch[1], 10);
+      const key = `${section}:${slot}`;
+      const name = this.textOf(match[2]) || this.attrValue(match[0].slice(0, match[0].indexOf('>') + 1), 'title');
+      const existing = bySlot.get(key);
+      // prefer the entry that carries a readable title
+      if (existing && existing.title && !name) continue;
+      bySlot.set(key, {
+        title: name || (existing ? existing.title : ''),
+        url: href.startsWith('http') ? href : this.absolute(href),
+        section: parseInt(section, 10),
+        slot,
+      });
     }
-    if (!chapters.length) {
+
+    const ordered = Array.from(bySlot.values()).sort((left, right) => (
+      left.section - right.section || left.slot - right.slot
+    ));
+    if (!ordered.length) {
       throw new Error('這個作品沒有可閱讀的章節。');
     }
+    const chapters = ordered.map((chapter, index) => ({
+      title: chapter.title || `第 ${index + 1} 話`,
+      url: chapter.url,
+    }));
     return {
       title,
       cover,
