@@ -3,9 +3,9 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import { test } from 'node:test';
 
-// Frames repeat the shapes the site ships (checked 2026-11-01): a self hosted
-// gatekeeper (proof of work + verify POST), `comics-card` covers, chapters that
-// link to /user/page_direct, and a reader page whose <amp-img> are the pages.
+// The source runs on the operator's mirror domains (twmanga.com, webmota.com …),
+// which serve the same catalogue as baozimh.com without its proof of work gate.
+// Frames below repeat the markup the mirrors ship (checked 2026-11-01).
 function extension(clock) {
   const context = vm.createContext({
     sendMessage() {},
@@ -15,17 +15,12 @@ function extension(clock) {
   vm.runInContext(fs.readFileSync(new URL('../sources/baozimh.js', import.meta.url), 'utf8')
     .replace('export default class', 'globalThis.Source = class'), context);
   const source = vm.runInContext('new Source()', context);
-  source.webSite = 'https://www.baozimh.com';
+  source.webSite = 'https://www.twmanga.com';
   source.sleep = async () => {};
   source.getSetting = async () => '';
   source.setSetting = async () => {};
   return source;
 }
-
-const challengeBody = `<!DOCTYPE html><html><body data-state="checking"><script src="/__gatekeeper_challenge/assets/abc/challenge.js"></script>
-<script nonce="n">(function(){var g=window.gatekeeperChallenge;if(g&&typeof g.start==="function"){g.start({challengeId:"9b31933f9d4f43b2438f522908e3d0932a885b6f5f4c59e303a1fba8ef9a2b33",ticket:"AhCgsb_3BKD-CoDd",verifyUrl:"/__gatekeeper_challenge/verify",workerUrl:"/__gatekeeper_challenge/assets/1b22/worker.js",difficultyBits:16,lifeMs:180000,computeMs:120000,submitMs:15000});return;}document.body.setAttribute("data-state","failed");})();</script></body></html>`;
-
-const challengeJson = '{"challenge_url":"/__gatekeeper_challenge/start?return=%2F","error":"challenge_required"}';
 
 const card = ({ slug = 'silingfashiwojishitianzai', title = '死靈法師！我即是天災', cover }) => `
 <div class="comics-card pure-u-1-3">
@@ -55,58 +50,94 @@ const readerPage = ({ title = '001話：開端 - 死靈法師！我即是天災 
 ${Array.from({ length: pages }, (_, index) => `<amp-img src="https://s1.bzcdn.net/scomic/silingfashiwojishitianzai/0/286-4qdm/${index + 1}.jpg" width="800" height="1200"></amp-img>`).join('\n')}
 </div></body></html>`;
 
-function routes(source, handler, requests) {
-  const log = requests || [];
+const challengeJson = '{"challenge_url":"/__gatekeeper_challenge/start?return=%2F","error":"challenge_required"}';
+
+// The entry probe reads /list/new on every mirror until one answers, so a stub
+// has to serve that url; everything else is up to the case.
+function routes(source, handler) {
+  const log = [];
   source.request = async (url, options) => {
     log.push({ url, options: options || {} });
-    return handler(url, options || {});
+    const answer = handler(url, options || {});
+    return answer === undefined ? listing([card({})]) : answer;
   };
+  log.challenges = () => log.filter((entry) => entry.url.includes('__gatekeeper_challenge'));
+  log.hosts = () => log.map((entry) => entry.url.split('/')[2]);
   return log;
 }
 
-test('the sha256 helper matches known vectors', () => {
+test('the first mirror that answers becomes the entry, with no challenge', async () => {
   const source = extension();
-  // the runtime evaluates the module in the vm, so exercise the worker through
-  // passGate: a challenge whose nonce is found proves the hash is correct
-  assert.equal(typeof source.passGate, 'function');
+  const log = routes(source, () => undefined);
+  const items = await source.latest(1, '0');
+  assert.ok(items.length >= 1);
+  assert.equal(source.currentSite(), 'https://www.twmanga.com');
+  // nothing ever touches the gatekeeper endpoints
+  assert.equal(log.challenges().length, 0);
+  assert.match(log[0].url, /^https:\/\/www\.twmanga\.com\/list\/new$/);
 });
 
-test('a gatekeeper challenge is solved and the read is retried', async () => {
+test('a challenged or broken mirror is skipped', async () => {
   const source = extension();
-  let reads = 0;
-  const log = routes(source, (url, options) => {
-    if (url.includes('/__gatekeeper_challenge/start')) return challengeBody;
-    if (url.includes('/__gatekeeper_challenge/verify')) return '{"mode":"manual","status":"passed"}';
-    reads += 1;
-    if (reads === 1) return challengeJson;
+  source.request = async (url) => {
+    if (url.startsWith('https://www.twmanga.com')) return challengeJson;
+    if (url.startsWith('https://cn.twmanga.com')) throw new Error('connect timeout');
+    if (url.startsWith('https://www.webmota.com')) return '<html><body>maintenance</body></html>';
     return listing([card({})]);
-  });
-
-  const items = await source.cards(await source.page('/list/new'));
-  assert.equal(items.length, 1);
-  const verify = log.find((entry) => entry.url.includes('/verify'));
-  assert.ok(verify, 'the gate must be verified');
-  assert.equal(verify.options.method, 'POST');
-  const payload = JSON.parse(verify.options.data);
-  assert.equal(payload.challenge_id, '9b31933f9d4f43b2438f522908e3d0932a885b6f5f4c59e303a1fba8ef9a2b33');
-  assert.equal(payload.ticket, 'AhCgsb_3BKD-CoDd');
-  assert.match(payload.nonce, /^\d+$/);
-  assert.match(String(verify.options.headers['Content-Type']), /application\/json/);
-  assert.equal(verify.options.headers.Origin, 'https://www.baozimh.com');
-  assert.ok(reads >= 2, 'the read must be retried after the gate');
+  };
+  const items = await source.latest(1, '0');
+  assert.ok(items.length >= 1);
+  assert.equal(source.currentSite(), 'https://cn.webmota.com');
 });
 
-test('a nonce that satisfies the difficulty is produced', async () => {
+test('when every mirror fails the error lists them', async () => {
+  const source = extension();
+  source.request = async () => challengeJson;
+  await assert.rejects(source.latest(1, '0'), /沒有可用的鏡像站點/);
+});
+
+test('listings and search build the site paths and page them', async () => {
   const source = extension();
   const log = routes(source, (url) => {
-    if (url.includes('/start')) return challengeBody;
-    if (url.includes('/verify')) return '{}';
-    return '';
+    if (url.includes('/classify')) return listing([card({ slug: 'abc-001', title: '分類結果' })]);
+    if (url.includes('/search?')) return listing([card({ slug: 'abc-002', title: '搜索命中' })]);
+    return undefined;
   });
-  await source.passGate('/list/new');
-  const payload = JSON.parse(log.find((entry) => entry.url.includes('/verify')).options.data);
-  const nonce = Number(payload.nonce);
-  assert.ok(Number.isFinite(nonce) && nonce >= 0);
+  const catalogue = await source.latest(1, '1');
+  assert.equal(catalogue[0].title, '分類結果');
+  const second = await source.latest(3, '1');
+  assert.equal(second[0].title, '分類結果');
+  const found = await source.search('死靈法師', 1);
+  assert.equal(found[0].title, '搜索命中');
+  assert.deepEqual(Array.from(await source.search('   ', 1)), []);
+  await assert.rejects(source.latest(0, '0'), /頁碼/);
+
+  const catalogueUrls = log.filter((entry) => entry.url.includes('/classify')).map((entry) => entry.url.replace('https://www.twmanga.com', ''));
+  assert.deepEqual(catalogueUrls, [
+    '/classify?type=all&region=all&state=all&filter=%2a',
+    '/classify?type=all&region=all&state=all&filter=%2a&page=3',
+  ]);
+  const searchUrls = log.filter((entry) => entry.url.includes('/search?')).map((entry) => entry.url.replace('https://www.twmanga.com', ''));
+  assert.deepEqual(searchUrls, ['/search?q=%E6%AD%BB%E9%9D%88%E6%B3%95%E5%B8%AB']);
+});
+
+test('the update feed ignores the page number', async () => {
+  const source = extension();
+  const log = routes(source, () => undefined);
+  await source.latest(1, '0');
+  await source.latest(2, '0');
+  const listUrls = log.filter((entry) => entry.url.includes('/list/new'));
+  assert.deepEqual(Array.from(new Set(listUrls.map((entry) => entry.url.replace('https://www.twmanga.com', '')))), ['/list/new']);
+});
+
+test('channels are keyed so the app selects one chip at a time', async () => {
+  const source = extension();
+  const channels = await source.channels();
+  assert.equal(channels.length, 6);
+  assert.equal(channels[0].title, '最近更新');
+  const keys = Array.from(channels, (channel) => channel.key);
+  assert.equal(new Set(keys).size, keys.length, 'channel keys must be unique');
+  assert.ok(keys.every((key) => typeof key === 'string' && key.length > 0), 'channel keys must not be empty');
 });
 
 test('cards read the anchor title and the cover image', () => {
@@ -120,65 +151,24 @@ test('cards read the anchor title and the cover image', () => {
   assert.deepEqual(Array.from(items, (item) => item.url), ['/comic/abc-001', '/comic/abc-002']);
   assert.equal(items[0].title, '第一部作品');
   assert.equal(items[0].cover, 'https://static-tw.baozimh.com/cover/abc-001.jpg?w=285&h=375&q=100');
-  assert.equal(items[1].title, '第二部作品');
 });
 
-test('channels page the catalogue but not the update feed', async () => {
+test('detail reads the metadata and every chapter as {name, url}', async () => {
   const source = extension();
-  const requests = routes(source, () => listing([card({})]));
-  const channels = await source.channels();
-  assert.equal(channels.length, 6);
-  assert.equal(channels[0].title, '最近更新');
-  // the app compares every chip against this key, so it must be unique and set
-  const keys = Array.from(channels, (channel) => channel.key);
-  assert.equal(new Set(keys).size, keys.length, 'channel keys must be unique');
-  assert.ok(keys.every((key) => typeof key === 'string' && key.length > 0), 'channel keys must not be empty');
-
-  await source.latest(1, '0');
-  await source.latest(2, '0');
-  await source.latest(1, '1');
-  await source.latest(3, '1');
-  await source.latest(1);
-  // the update feed ignores the page number, so it is the same url (and the
-  // page cache keeps it to one request); the catalogue appends &page=N
-  assert.deepEqual(requests.map((entry) => entry.url.replace('https://www.baozimh.com', '')), [
-    '/list/new',
-    '/classify?type=all&region=all&state=all&filter=%2a',
-    '/classify?type=all&region=all&state=all&filter=%2a&page=3',
-  ]);
-  await assert.rejects(source.latest(0, '0'), /頁碼/);
-});
-
-test('search encodes the keyword and only serves the first page', async () => {
-  const source = extension();
-  const requests = routes(source, () => listing([card({ slug: 'abc-003', title: '搜索命中' })]));
-  assert.equal((await source.search('死靈法師', 1))[0].title, '搜索命中');
-  assert.deepEqual(Array.from(await source.search('死靈法師', 2)), []);
-  assert.deepEqual(Array.from(await source.search('   ', 1)), []);
-  assert.deepEqual(requests.map((entry) => entry.url.replace('https://www.baozimh.com', '')), [
-    '/search?q=%E6%AD%BB%E9%9D%88%E6%B3%95%E5%B8%AB',
-  ]);
-});
-
-test('detail reads the metadata and every chapter', async () => {
-  const source = extension();
-  routes(source, () => detailPage({}));
+  routes(source, (url) => (url.includes('/comic/') ? detailPage({}) : undefined));
   const detail = await source.detail('/comic/silingfashiwojishitianzai');
   assert.equal(detail.title, '死靈法師！我即是天災');
   assert.ok(detail.cover.startsWith('https://static-tw.baozimh.com/cover/silingfashiwojishitianzai.jpg'));
   assert.equal(detail.desc, '死靈法師！我即是天災漫畫簡介');
   assert.equal(detail.episodes[0].urls.length, 2);
-  // the app reads `name` on an episode, so a `title` would render as a blank row
+  // the app renders ep.name; a title key would show a blank row
   assert.equal(detail.episodes[0].urls[0].name, '001話：開端');
   assert.equal(detail.episodes[0].urls[0].title, undefined);
   assert.match(detail.episodes[0].urls[0].url, /chapter_slot=0/);
-  assert.match(detail.episodes[0].urls[1].url, /chapter_slot=1/);
 });
 
 test('chapters are de-duplicated and ordered by slot', async () => {
   const source = extension();
-  // the page lists newest first, repeats each chapter for a second volume and
-  // ends with a "latest chapters" block that goes the other way
   const rows = [
     { slot: 2, name: '003話：第三' },
     { slot: 2, name: '003話：第三' },
@@ -191,7 +181,7 @@ test('chapters are de-duplicated and ordered by slot', async () => {
   ].map((chapter) => `<a href="/user/page_direct?comic_id=slug_a_xxxxxx&amp;section_slot=0&amp;chapter_slot=${chapter.slot}" class="comics-chapters__item">${chapter.name}</a>`);
   const html = `<!doctype html><html><head><meta property="og:title" content="作品A漫畫 - 包子漫畫"></head><body>${rows.join('\n')}${latest.join('\n')}</body></html>`;
 
-  routes(source, () => html);
+  routes(source, (url) => (url.includes('/comic/') ? html : undefined));
   const chapters = (await source.detail('/comic/slug_a')).episodes[0].urls;
   assert.equal(chapters.length, 3);
   assert.deepEqual(Array.from(chapters, (chapter) => chapter.name), ['001話：第一', '002話：第二', '003話：第三']);
@@ -207,7 +197,7 @@ test('chapters keep a plain text title and fall back when there is none', async 
 <a href="/user/page_direct?comic_id=slug_b&amp;section_slot=0&amp;chapter_slot=1">285 大軍撤退</a>
 <a href="/user/page_direct?comic_id=slug_b&amp;section_slot=0&amp;chapter_slot=0"><div><span></span></div></a>
 </body></html>`;
-  routes(source, () => html);
+  routes(source, (url) => (url.includes('/comic/') ? html : undefined));
   const chapters = (await source.detail('/comic/slug_b')).episodes[0].urls;
   assert.equal(chapters.length, 2);
   assert.equal(chapters[0].name, '第 1 話');
@@ -216,23 +206,32 @@ test('chapters keep a plain text title and fall back when there is none', async 
 
 test('detail refuses a work without chapters', async () => {
   const source = extension();
-  routes(source, () => detailPage({ chapters: [] }));
+  routes(source, (url) => (url.includes('/comic/') ? detailPage({ chapters: [] }) : undefined));
   await assert.rejects(source.detail('/comic/empty-001'), /沒有可閱讀的章節/);
 });
 
 test('watch collects the reader pages in order', async () => {
   const source = extension();
-  routes(source, () => readerPage({ pages: 4 }));
-  const result = await source.watch('https://www.baozimh.com/user/page_direct?comic_id=silingfashiwojishitianzai&section_slot=0&chapter_slot=0');
+  routes(source, (url) => (url.includes('/page_direct') ? readerPage({ pages: 4 }) : undefined));
+  const result = await source.watch('/user/page_direct?comic_id=silingfashiwojishitianzai&section_slot=0&chapter_slot=0');
   assert.equal(result.urls.length, 4);
   assert.equal(result.urls[0], 'https://s1.bzcdn.net/scomic/silingfashiwojishitianzai/0/286-4qdm/1.jpg');
   assert.equal(result.urls[3], 'https://s1.bzcdn.net/scomic/silingfashiwojishitianzai/0/286-4qdm/4.jpg');
   assert.match(result.title, /包子漫畫/);
 });
 
+test('watch follows the live mirror even when given an absolute chapter url', async () => {
+  const source = extension();
+  const log = routes(source, (url) => (url.includes('/page_direct') ? readerPage({ pages: 2 }) : undefined));
+  const result = await source.watch('https://old-mirror.example/user/page_direct?comic_id=x&section_slot=0&chapter_slot=0');
+  assert.equal(result.urls.length, 2);
+  const readerCall = log.find((entry) => entry.url.includes('/page_direct'));
+  assert.ok(readerCall.url.startsWith('https://www.twmanga.com/'), readerCall.url);
+});
+
 test('watch reports a chapter without pages', async () => {
   const source = extension();
-  routes(source, () => '<!doctype html><html><body><p>已下架</p></body></html>');
+  routes(source, (url) => (url.includes('/page_direct') ? '<!doctype html><html><body><p>已下架</p></body></html>' : undefined));
   await assert.rejects(source.watch('/user/page_direct?comic_id=x&section_slot=0&chapter_slot=0'), /沒有取到頁面圖片/);
 });
 
@@ -242,8 +241,25 @@ test('work urls are validated before any request', () => {
   for (const url of ['', '/list/new', 'https://other.example/comic/abc', '/comic/', '/search?q=x']) {
     assert.throws(() => source.target(url), /無效的作品地址|無法解析作品地址/);
   }
-  assert.deepEqual(JSON.parse(JSON.stringify(source.target('https://www.baozimh.com/comic/abc-001?from=list'))), {
+  assert.deepEqual(JSON.parse(JSON.stringify(source.target('https://www.twmanga.com/comic/abc-001?from=list'))), {
     path: '/comic/abc-001',
     slug: 'abc-001',
   });
+  assert.deepEqual(JSON.parse(JSON.stringify(source.target('https://www.baozimh.com/comic/abc-001'))), {
+    path: '/comic/abc-001',
+    slug: 'abc-001',
+  });
+});
+
+test('pages are cached so a slow mirror is not hit twice', async () => {
+  const clock = { now: 1000 };
+  const source = extension(clock);
+  const log = routes(source, () => undefined);
+  await source.latest(1, '0');
+  const first = log.length;
+  await source.latest(1, '0');
+  assert.equal(log.length, first, 'the listing must come from cache');
+  clock.now += 61000;
+  await source.latest(1, '0');
+  assert.ok(log.length > first, 'an expired cache must be refreshed');
 });

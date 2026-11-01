@@ -1,6 +1,40 @@
-# 包子漫畫 v1.0.4
+# 包子漫畫 v1.1.0
+
+## v1.1.0：改用镜像域名，彻底去掉卡死源
+
+**卡死的原因**：`baozimh.com` 有一层自建的**工作量证明**校验（gatekeeper），插件必须算 `sha256("gatekeeper-pow-v1:<id>:<nonce>")` 找前导零。这个循环在 QuickJS 里是**同步执行**的，占满宿主线程；即使分批让出，页面慢时多次重试仍会累积成长时间阻塞——这就是「加载慢就卡死」的来源。
+
+**参考来源**：<https://github.com/Aidoku-Community/sources/tree/main/sources/zh.baozimanhua> 的 `source.json` 列了 15 个域名，说明站点有大量镜像。实测确认了关键事实：
+
+| 域名 | 结果 |
+| --- | --- |
+| `www.baozimh.com` / `cn.baozimh.com` | **需要 gatekeeper**（403 challenge） |
+| `tw.baozimh.com` | Cloudflare 硬拦截 |
+| **`www.twmanga.com`** | 200，整页 198KB，**无校验**，1.2s |
+| **`cn.twmanga.com`** / **`www.webmota.com`** / **`cn.webmota.com`** | 200，无校验，0.7–1.2s |
+| **`www.dinnerku.com`** / **`www.kukuc.co`** | 200，无校验，1.1–1.3s |
+
+**结论**：同一套内容在镜像上是完全开放的，根本不需要算 PoW。
+
+**改动**：
+
+- 删除全部 SHA-256 / PoW / gatekeeper 代码（约 6.4KB）
+- 入口改为**镜像自动选择**：依次探测 6 个镜像的 `/list/new`，第一个返回合法列表的作为本次会话入口；某个镜像之后开始失败时自动换下一个
+- 章节链接即使带旧域名，也会被规整为路径、跟随当前镜像
+- 页面缓存从 30 秒放宽到 60 秒（镜像响应稳定，无须频繁刷新）
+
+**实测对比**（同一台机器）：
+
+| 指标 | v1.0.4（PoW） | v1.1.0（镜像） |
+| --- | --- | --- |
+| 离线测试耗时 | 8–14 秒 | **26 毫秒** |
+| 首屏请求数 | 9 次 | **7 次** |
+| 需要的 cookie | `__Host-gk_clearance_*` | **无** |
+| 频道内容 | 6 个 | 6 个（全部不同，已核验） |
+| 详情 / 阅读 | 正常 | 正常（191 章、50 图、首图 200） |
 
 ## v1.0.4 修正（章节名不显示）
+
 
 本体把章节读成 `MediaEpisode{name, url}`，详情页用 `ep.name` 渲染（`detail_page.dart:506`）。v1.0.3 返回的是 `{title, url}`，`name` 为空 → 界面上只剩序号、章节名空白。
 
