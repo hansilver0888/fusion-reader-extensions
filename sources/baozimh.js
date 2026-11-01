@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         包子漫畫
-// @version      v1.0.3
+// @version      v1.0.4
 // @author       FusionReader
 // @lang         zh-tw
 // @license      MIT
@@ -481,8 +481,9 @@ export default class extends Extension {
     if (!ordered.length) {
       throw new Error('這個作品沒有可閱讀的章節。');
     }
+    // a chapter is { name, url }: the app reads `name`, a `title` key is ignored
     const chapters = ordered.map((chapter, index) => ({
-      title: chapter.title || `第 ${index + 1} 話`,
+      name: chapter.title || `第 ${index + 1} 話`,
       url: chapter.url,
     }));
     return {

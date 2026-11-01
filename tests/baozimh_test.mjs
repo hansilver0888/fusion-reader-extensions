@@ -168,7 +168,9 @@ test('detail reads the metadata and every chapter', async () => {
   assert.ok(detail.cover.startsWith('https://static-tw.baozimh.com/cover/silingfashiwojishitianzai.jpg'));
   assert.equal(detail.desc, '死靈法師！我即是天災漫畫簡介');
   assert.equal(detail.episodes[0].urls.length, 2);
-  assert.equal(detail.episodes[0].urls[0].title, '001話：開端');
+  // the app reads `name` on an episode, so a `title` would render as a blank row
+  assert.equal(detail.episodes[0].urls[0].name, '001話：開端');
+  assert.equal(detail.episodes[0].urls[0].title, undefined);
   assert.match(detail.episodes[0].urls[0].url, /chapter_slot=0/);
   assert.match(detail.episodes[0].urls[1].url, /chapter_slot=1/);
 });
@@ -192,7 +194,7 @@ test('chapters are de-duplicated and ordered by slot', async () => {
   routes(source, () => html);
   const chapters = (await source.detail('/comic/slug_a')).episodes[0].urls;
   assert.equal(chapters.length, 3);
-  assert.deepEqual(Array.from(chapters, (chapter) => chapter.title), ['001話：第一', '002話：第二', '003話：第三']);
+  assert.deepEqual(Array.from(chapters, (chapter) => chapter.name), ['001話：第一', '002話：第二', '003話：第三']);
   assert.deepEqual(
     Array.from(chapters, (chapter) => (chapter.url.match(/chapter_slot=(\d+)/) || [])[1]),
     ['0', '1', '2'],
@@ -208,8 +210,8 @@ test('chapters keep a plain text title and fall back when there is none', async 
   routes(source, () => html);
   const chapters = (await source.detail('/comic/slug_b')).episodes[0].urls;
   assert.equal(chapters.length, 2);
-  assert.equal(chapters[0].title, '第 1 話');
-  assert.equal(chapters[1].title, '285 大軍撤退');
+  assert.equal(chapters[0].name, '第 1 話');
+  assert.equal(chapters[1].name, '285 大軍撤退');
 });
 
 test('detail refuses a work without chapters', async () => {
