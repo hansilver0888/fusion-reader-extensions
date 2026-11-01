@@ -3,3 +3,10 @@ __pycache__/
 *.pyc
 
 /archive/local/
+
+# Source-sweep scratch output (see docs/shuyuan.md); the scripts are committed,
+# the downloaded book-source dump and per-run results are not.
+/build-cache/*.jsonl
+/build-cache/candidates*.json
+/build-cache/debug-page.html
+/build-cache/__pycache__/

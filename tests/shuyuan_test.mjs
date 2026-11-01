@@ -315,6 +315,88 @@ test('pasting a detail url opens the matching source and foreign hosts are rejec
   await assert.rejects(s.search('https://foreign.example.test/book/1/', 1), /不属于/);
 });
 
+test('builtin list only exposes hosts present in the source json', async () => {
+  // 内置清单里的 booksky.cc 出现在书源数据中，其余内置站点不存在时应被隐藏。
+  const builtinSource = {
+    bookSourceName: '快眼看书', bookSourceUrl: 'https://www.booksky.cc/', bookSourceType: 0, enabled: true,
+    exploreUrl: '玄幻::/sort1/{{page}}.html',
+    searchUrl: '/search.php?q={{key}}',
+    ruleSearch: { bookList: '.item', name: 'h3 a@text', bookUrl: 'h3 a@href' },
+    ruleExplore: { bookList: '.item', name: 'h3 a@text', bookUrl: 'h3 a@href' },
+    ruleBookInfo: { name: 'h1@text' },
+    ruleToc: { chapterList: '#list li a', chapterName: 'text', chapterUrl: 'href' },
+    ruleContent: { content: '#content@text' },
+  };
+  const s = source({ sourceUrl: LIST_URL });
+  s.request = async (url) => {
+    if (url === LIST_URL) return [builtinSource];
+    throw new Error('unexpected ' + url);
+  };
+  const builtins = await s.availableBuiltins();
+  assert.deepEqual(Array.from(builtins, (b) => b.host), ['booksky.cc']);
+  const channels = await s.channels();
+  assert.deepEqual(plain(channels), [{ title: '快眼看书·玄幻', key: 'auto|booksky.cc|/sort1/{{page}}.html' }]);
+});
+
+test('builtin channel selection drives latest and is remembered for search', async () => {
+  const builtinSource = {
+    bookSourceName: '快眼看书', bookSourceUrl: 'https://www.booksky.cc/', bookSourceType: 0, enabled: true,
+    exploreUrl: '玄幻::/sort1/{{page}}.html',
+    searchUrl: '/search.php?q={{key}}',
+    ruleSearch: { bookList: '.item', name: 'h3 a@text', bookUrl: 'h3 a@href' },
+    ruleExplore: { bookList: '.item', name: 'h3 a@text', bookUrl: 'h3 a@href' },
+    ruleBookInfo: { name: 'h1@text' },
+    ruleToc: { chapterList: '#list li a', chapterName: 'text', chapterUrl: 'href' },
+    ruleContent: { content: '#content@text' },
+  };
+  const page = `<div class="item"><h3><a href="/book/7/">山河稷</a></h3></div>`;
+  const s = source({ sourceUrl: LIST_URL });
+  const calls = [];
+  s.request = async (url) => {
+    calls.push(url);
+    if (url === LIST_URL) return [builtinSource];
+    return page;
+  };
+  const items = await s.latest(2, 'auto|booksky.cc|/sort1/{{page}}.html');
+  assert.equal(calls[calls.length - 1], 'https://www.booksky.cc/sort1/2.html');
+  assert.equal(items[0].title, '山河稷');
+  // 点选过的书源会被记住，搜索直接走它。
+  const found = await s.search('山河稷', 1);
+  assert.equal(calls[calls.length - 1], 'https://www.booksky.cc/search.php?q=%E5%B1%B1%E6%B2%B3%E7%A8%B7');
+  assert.equal(found[0].title, '山河稷');
+});
+
+test('search falls back across builtin sources until one returns results', async () => {
+  const emptySource = {
+    bookSourceName: '空结果源', bookSourceUrl: 'https://booksky.cc/', bookSourceType: 0, enabled: true,
+    searchUrl: '/search?q={{key}}',
+    ruleSearch: { bookList: '.item', name: 'h3 a@text', bookUrl: 'h3 a@href' },
+    ruleBookInfo: { name: 'h1@text' },
+    ruleToc: { chapterList: 'li a', chapterName: 'text', chapterUrl: 'href' },
+    ruleContent: { content: '#c@text' },
+  };
+  const goodSource = {
+    bookSourceName: '有结果源', bookSourceUrl: 'https://b.faloo.com/', bookSourceType: 0, enabled: true,
+    searchUrl: '/search?q={{key}}',
+    ruleSearch: { bookList: '.item', name: 'h3 a@text', bookUrl: 'h3 a@href' },
+    ruleBookInfo: { name: 'h1@text' },
+    ruleToc: { chapterList: 'li a', chapterName: 'text', chapterUrl: 'href' },
+    ruleContent: { content: '#c@text' },
+  };
+  const s = source({ sourceUrl: LIST_URL });
+  const calls = [];
+  s.request = async (url) => {
+    calls.push(url);
+    if (url === LIST_URL) return [emptySource, goodSource];
+    if (url.startsWith('https://booksky.cc/')) return '<html><body>没有找到相关作品</body></html>';
+    return '<div class="item"><h3><a href="/book/9/">找到的书</a></h3></div>';
+  };
+  const items = await s.search('随便', 1);
+  assert.equal(items[0].title, '找到的书');
+  assert.equal(calls.filter((u) => u.startsWith('https://booksky.cc/')).length, 1);
+  assert.equal(calls.filter((u) => u.startsWith('https://b.faloo.com/')).length, 1);
+});
+
 test('rule helpers keep invalid input safe instead of failing whole sources', () => {
   const s = ext();
   assert.deepEqual(plain(s.splitRegex('a@text##re##$1###')), { body: 'a@text', regex: 're', repl: '$1', flags: '' });

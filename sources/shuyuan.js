@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         书源引擎
-// @version      v0.1.0
+// @version      v0.2.0
 // @author       FusionReader
 // @lang         zh
 // @license      MIT
@@ -31,20 +31,43 @@ const ATTR_WORDS = new Set(['href', 'src', 'content', 'value', 'alt', 'title', '
   'data-src', 'data-original', 'data-url', 'data-echo', 'poster', 'url']);
 const TEXT_WORDS = new Set(['text', 'textNodes', 'html', 'own', 'all']);
 
+// ===== 内置可用书源清单（2026-11-01 实测） =====
+// 每条都完成了「搜索 → 详情 → 目录 → 正文」四步链路校验。此处只记录站点与
+// 显示名，解析规则仍从书源 JSON 按域名匹配，上游更新规则后无需重新发版。
+// 源站会失效，该清单按当时的网络环境测得，可随时改回「书源名称」自行指定。
+const BUILTIN_SOURCES = [
+  { host: 'booksky.cc', name: '快眼看书', note: '章节最全' },
+  { host: 'b.faloo.com', name: '飞卢小说', note: '本站原创' },
+  { host: 'xbotaodz.com', name: '快眼看书②', note: '备用线路' },
+  { host: 'biquge55.net', name: '笔趣阁', note: '完本多' },
+  { host: 'wtzw.com', name: '梧桐中文', note: '男频全' },
+  { host: 'xiangtxsw.com', name: '乡土小说', note: '乡村题材' },
+  { host: 'm.shuhaige.net', name: '书海阁', note: '移动版' },
+  { host: 'haitangshufang.com', name: '海棠书屋', note: '轻小说' },
+  { host: 'novel.tingroom.com', name: '英文小说', note: '英文读物' },
+  { host: 'm.haitang4.com', name: '海棠书屋②', note: '移动版' },
+  { host: 'wap.jhssd.com', name: '精华书阁', note: '精品' },
+  { host: 'm.po18gw.com', name: 'PO18文学', note: '成人向' },
+  { host: 'wap.po18.work', name: 'PO18文学②', note: '备用线路' },
+  { host: 'tiantangxiangzuoshenzhenwangyou.qwyd.net', name: '天堂深圳', note: '小众' },
+];
+const AUTO_SOURCE_KEY = 'auto';
+
 export default class extends Extension {
   _listCache = null;     // { time, url, list }
   _selectedCache = null; // { url, name, src }
+  _activeSource = null;  // 发现页点选的书源，搜索优先使用
   _vars = new Map();     // @put/@get 变量，键含书源与作品地址
 
   async load() {
     await this.registerSetting({
       title: '书源 JSON 地址', key: 'sourceUrl', type: 'input',
-      description: '阅读(Legado)格式书源合集链接，默认使用 shuyuan-bak 的验证书源 good.json（约 16MB，首次加载较慢，建议在网络良好时使用，或改填较小的书源合集链接）',
+      description: '阅读(Legado)格式书源合集链接，默认使用 shuyuan-bak 的验证书源 good.json（约 16MB，首次加载较慢）。发现页会列出本插件实测可用的书源，点选即可切换',
       defaultValue: DEFAULT_SOURCE_URL,
     });
     await this.registerSetting({
-      title: '书源名称', key: 'sourceName', type: 'input',
-      description: '要使用的书源名称或其片段（如「速读谷」），也可填书源域名片段；留空则使用列表中第一个可用书源',
+      title: '指定书源（可选）', key: 'sourceName', type: 'input',
+      description: '留空即可：搜索会依次尝试内置可用书源。填书源名称或域名片段（如「快眼看书」「booksky.cc」）则固定使用该书源',
       defaultValue: '',
     });
   }
@@ -179,10 +202,17 @@ export default class extends Extension {
     if (name) {
       src = list.find((s) => s.bookSourceName === name)
         || list.find((s) => String(s.bookSourceName || '').includes(name))
-        || list.find((s) => String(s.bookSourceUrl || '').includes(name));
+        || list.find((s) => String(s.bookSourceUrl || '').includes(name))
+        // 内置清单以域名作为键，允许用户直接填域名或选中内置项。
+        || list.find((s) => this.host(s.bookSourceUrl) === this.host(name));
       if (!src) throw new Error(`没有找到名称或地址包含「${name}」的可用书源，请检查设置。`);
     } else {
-      src = list[0];
+      // 未指定时优先选内置清单里第一个确实可用的站点，其次才是列表首项。
+      for (const builtin of BUILTIN_SOURCES) {
+        const hit = list.find((s) => this.host(s.bookSourceUrl) === builtin.host);
+        if (hit) { src = hit; break; }
+      }
+      if (!src) src = list[0];
     }
     this._selectedCache = { url, name, src };
     return src;
@@ -773,10 +803,38 @@ export default class extends Extension {
     return items;
   }
 
+  // 内置清单里「确实出现在当前书源 JSON 中」的条目，作为可选书源。
+  async availableBuiltins() {
+    const list = await this.sourceList(false);
+    const out = [];
+    for (const builtin of BUILTIN_SOURCES) {
+      const src = list.find((s) => this.host(s.bookSourceUrl) === builtin.host);
+      if (src) out.push(Object.assign({ src }, builtin));
+    }
+    return out;
+  }
+
+  // 发现页直接列出实测可用的书源，点选即切换；每个分类都带着自己的书源，
+  // latest() 据此定位规则，避免依赖设置里手填名称。
   async channels() {
     try {
-      const src = await this.selectedSource();
-      return this.exploreChannels(src);
+      const builtins = await this.availableBuiltins();
+      if (!builtins.length) {
+        const src = await this.selectedSource();
+        return this.exploreChannels(src);
+      }
+      const out = [];
+      for (const builtin of builtins) {
+        const categories = this.exploreChannels(builtin.src);
+        if (!categories.length) {
+          out.push({ title: builtin.name, key: `${AUTO_SOURCE_KEY}|${builtin.host}|` });
+          continue;
+        }
+        for (const category of categories.slice(0, 4)) {
+          out.push({ title: `${builtin.name}·${category.title}`, key: `${AUTO_SOURCE_KEY}|${builtin.host}|${category.key}` });
+        }
+      }
+      return out.slice(0, MAX_CHANNELS);
     } catch (_) {
       return []; // 书源列表未就绪时不阻塞发现页
     }
@@ -785,17 +843,29 @@ export default class extends Extension {
   async latest(page, channel) {
     const p = Number(page) || 1;
     if (p < 1 || p > 500) throw new Error('页码不正确。');
-    const src = await this.selectedSource();
-    const list = this.exploreChannels(src);
-    if (!list.length) throw new Error('当前书源没有发现页分类。');
-    let key = channel;
-    if (!key) key = list[0].key;
-    if (!list.some((c) => c.key === key)) {
-      const hit = list.find((c) => c.title === key);
-      if (!hit) throw new Error('发现页分类不存在，请重新进入发现页。');
-      key = hit.key;
+    // 内置分类的 key 形如 auto|<host>|<分类地址>，直接定位到对应书源。
+    let src = null;
+    let exploreUrl = null;
+    const key = String(channel || '');
+    if (key.startsWith(`${AUTO_SOURCE_KEY}|`)) {
+      const [, host, rest] = key.split('|');
+      const builtins = await this.availableBuiltins();
+      const builtin = builtins.find((b) => b.host === host);
+      if (!builtin) throw new Error('该书源已不在当前书源列表中，请重新进入发现页。');
+      src = builtin.src;
+      exploreUrl = rest || (this.exploreChannels(src)[0] || {}).key || '';
+      this._activeSource = src; // 记下点选的源，后续搜索沿用它
+    } else {
+      src = await this.selectedSource();
+      exploreUrl = key || (this.exploreChannels(src)[0] || {}).key || '';
+      // 显式传入的分类必须属于该书源，否则说明界面还在用旧的分类键。
+      if (key && !this.exploreChannels(src).some((c) => c.key === key)
+        && !this.exploreChannels(src).some((c) => c.title === key)) {
+        throw new Error('发现页分类不存在，请重新进入发现页。');
+      }
     }
-    const built = await this.buildUrl(key, { source: src, baseUrl: src.bookSourceUrl, page: p });
+    if (!exploreUrl) throw new Error('当前书源没有发现页分类，请使用搜索。');
+    const built = await this.buildUrl(exploreUrl, { source: src, baseUrl: src.bookSourceUrl, page: p });
     let res;
     try {
       res = await this.request(built.url, { method: built.method, headers: built.headers, data: built.data });
@@ -826,22 +896,38 @@ export default class extends Extension {
       } catch (_) { /* 名称失败不阻塞打开 */ }
       return [{ title: title || keyword.replace(/^https?:\/\//i, '').slice(0, 40), url: keyword, cover: '', update: String(src.bookSourceName || '') }];
     }
-    const src = await this.selectedSource();
-    const template = this.searchUrlOf(src);
-    const rule = this.ruleObj(src, 'ruleSearch');
-    if (!template || !String(rule.bookList || '').trim()) throw new Error('当前书源不支持搜索，请在设置中更换书源。');
-    if (p > 1 && !/\{\{[^}]*page/.test(template)) return []; // 无分页参数的书源只有第一页
-    const built = await this.buildUrl(template, { source: src, baseUrl: src.bookSourceUrl, key: keyword, page: p });
-    let res;
+    // 优先用发现页点选过的书源；否则按内置清单顺序依次尝试，
+    // 谁的搜索有结果就用谁，避免用户必须先手填书源名才能搜。
+    const candidates = [];
+    if (this._activeSource) candidates.push(this._activeSource);
     try {
-      res = await this.request(built.url, { method: built.method, headers: built.headers, data: built.data });
-    } catch (_) {
-      throw new Error('搜索请求失败，该书源可能已失效或被限流。');
+      for (const builtin of await this.availableBuiltins()) {
+        if (!candidates.some((s) => this.host(s.bookSourceUrl) === builtin.host)) candidates.push(builtin.src);
+      }
+    } catch (_) { /* 列表不可用时退回设置里的书源 */ }
+    if (!candidates.length) candidates.push(await this.selectedSource());
+    let lastError = null;
+    for (const src of candidates) {
+      const template = this.searchUrlOf(src);
+      const rule = this.ruleObj(src, 'ruleSearch');
+      if (!template || !String(rule.bookList || '').trim()) continue;
+      if (p > 1 && !/\{\{[^}]*page/.test(template)) continue; // 无分页参数的书源只有第一页
+      let built;
+      try {
+        built = await this.buildUrl(template, { source: src, baseUrl: src.bookSourceUrl, key: keyword, page: p });
+        const res = await this.request(built.url, { method: built.method, headers: built.headers, data: built.data });
+        if (typeof res === 'string' && res.includes('<form id="challenge-form"')) continue;
+        const items = await this.parseBooks(rule, { html: res, baseUrl: built.url, source: src, key: keyword, page: p });
+        if (items.length) {
+          this._activeSource = src;
+          return items;
+        }
+      } catch (error) {
+        lastError = error;
+      }
     }
-    if (typeof res === 'string' && res.includes('<form id="challenge-form"')) {
-      throw new Error('搜索被站点验证拦截，请稍后再试或更换书源。');
-    }
-    return this.parseBooks(rule, { html: res, baseUrl: built.url, source: src, key: keyword, page: p });
+    if (lastError && this._activeSource) throw new Error('搜索请求失败，该书源可能已失效或被限流。');
+    return []; // 所有源都没有结果时返回空，而不是报错
   }
 
   async detail(url) {
