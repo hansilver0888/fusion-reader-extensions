@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         包子漫畫
-// @version      v1.0.0
+// @version      v1.0.1
 // @author       FusionReader
 // @lang         zh-tw
 // @license      MIT
@@ -95,7 +95,12 @@ function leadingZeroBits(words) {
 // one never changes, the second holds the nonce plus the padding. The state
 // after the first block is computed once, which leaves one block compression per
 // candidate (16 bits is ~65k candidates, and QuickJS is slow).
-function powSearch(prefix, challengeId, difficultyBits, limit) {
+// Searching runs in batches: a single synchronous sweep of a few hundred
+// thousand candidates freezes the whole app (the loop never yields), so every
+// batch hands control back through the runtime's sleep. 16 bits needs ~65k
+// candidates on average; 300k covers 99.5% of draws and keeps the worst case
+// around ten seconds instead of minutes.
+async function powSearch(prefix, challengeId, difficultyBits, limit, sleep) {
   const fixed = utf8Bytes(`${prefix}${challengeId}:`);
   const baseLength = fixed.length;
   const maxNonceLength = String(limit).length;
@@ -117,25 +122,31 @@ function powSearch(prefix, challengeId, difficultyBits, limit) {
   const tail = new Uint8Array(64);
   for (let i = 0; i < tailBase; i += 1) tail[i] = fixed[tailOffset + i];
 
-  for (let nonce = 0; nonce < limit; nonce += 1) {
-    const digits = String(nonce);
-    for (let i = 0; i < 64; i += 1) block[i] = tail[i];
-    for (let i = 0; i < digits.length; i += 1) block[tailBase + i] = digits.charCodeAt(i);
-    const length = baseLength + digits.length;
-    block[tailBase + digits.length] = 0x80;
-    // the 64 bit big endian message length lives in the last 8 bytes of the block
-    const bits = length * 8;
-    block[56] = 0;
-    block[57] = 0;
-    block[58] = 0;
-    block[59] = 0;
-    block[60] = (bits >>> 24) & 0xff;
-    block[61] = (bits >>> 16) & 0xff;
-    block[62] = (bits >>> 8) & 0xff;
-    block[63] = bits & 0xff;
+  const batch = 2000;
+  for (let start = 0; start < limit; start += batch) {
+    const end = Math.min(start + batch, limit);
+    for (let nonce = start; nonce < end; nonce += 1) {
+      const digits = String(nonce);
+      for (let i = 0; i < 64; i += 1) block[i] = tail[i];
+      for (let i = 0; i < digits.length; i += 1) block[tailBase + i] = digits.charCodeAt(i);
+      const length = baseLength + digits.length;
+      block[tailBase + digits.length] = 0x80;
+      // the 64 bit big endian message length lives in the last 8 bytes of the block
+      const bits = length * 8;
+      block[56] = 0;
+      block[57] = 0;
+      block[58] = 0;
+      block[59] = 0;
+      block[60] = (bits >>> 24) & 0xff;
+      block[61] = (bits >>> 16) & 0xff;
+      block[62] = (bits >>> 8) & 0xff;
+      block[63] = bits & 0xff;
 
-    const words = compressBlock(block, state);
-    if (leadingZeroBits(words) >= difficultyBits) return digits;
+      const words = compressBlock(block, state);
+      if (leadingZeroBits(words) >= difficultyBits) return digits;
+    }
+    // let the host breathe between batches
+    if (sleep) await sleep(1);
   }
   return '';
 }
@@ -285,7 +296,8 @@ export default class extends Extension {
       throw new Error('無法取得瀏覽器驗證（站點改版？）。');
     }
 
-    const solution = powSearch(GATE_PREFIX, challengeId, difficultyBits, 4000000);
+    // ~65k candidates are expected at 16 bits; 300k keeps a bad draw bounded
+    const solution = await powSearch(GATE_PREFIX, challengeId, difficultyBits, 300000, (ms) => this.sleep(ms));
     if (!solution) throw new Error('瀏覽器驗證計算失敗。');
 
     await this.request(this.absolute(verifyUrl), {
