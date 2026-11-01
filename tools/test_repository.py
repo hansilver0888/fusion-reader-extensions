@@ -1,4 +1,5 @@
 import hashlib
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,8 +18,8 @@ class RepositoryTests(unittest.TestCase):
                 self.assertEqual(len(data), entry['size'])
                 self.assertEqual(hashlib.sha256(data).hexdigest(), entry['sha256'])
                 self.assertIn('// @package', data.decode('utf-8'))
-                self.assertEqual(entry['minAppVersion'],
-                                 '1.4.2' if entry['package'] == 'omofun' else '1.4.0')
+                minimum = re.search(r'@minAppVersion\s+([^\r\n]+)', data.decode('utf-8'))
+                self.assertEqual(entry['minAppVersion'], minimum[1].strip() if minimum else '1.4.0')
             self.assertEqual(packages, {path.stem for path in (ROOT / 'sources').glob('*.js')})
 
 
