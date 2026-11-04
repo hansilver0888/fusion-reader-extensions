@@ -27,11 +27,12 @@ function extension(clock) {
 
 // same wire format as the site: 16 ascii iv characters + hex cipher text
 function encryptPayload(text, key = KEY) {
-  const iv = crypto.randomBytes(16);
+  // The wire IV is 16 printable ASCII characters inside a quoted HTML string.
+  // Arbitrary binary bytes could insert a quote and randomly break the fixture.
+  const ivText = crypto.randomBytes(8).toString('hex');
+  const iv = Buffer.from(ivText, 'ascii');
   const cipher = crypto.createCipheriv('aes-128-cbc', Buffer.from(key, 'utf8'), iv);
   const encrypted = Buffer.concat([cipher.update(Buffer.from(text, 'utf8')), cipher.final()]);
-  // the iv travels as latin1 characters; keep them printable-ish
-  const ivText = iv.toString('latin1');
   return ivText + encrypted.toString('hex');
 }
 
