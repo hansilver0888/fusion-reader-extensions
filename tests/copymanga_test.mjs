@@ -228,10 +228,10 @@ test('search parses the json envelope and pages it', async () => {
   assert.match(searchUrls[1], /offset=24/);
 });
 
-test('a broken search response yields no items', async () => {
+test('search reports site errors instead of a false empty result', async () => {
   const source = extension();
   routes(source, (url) => (url.includes('searchcl') ? '{"code":210,"message":"請到官網更新"}' : undefined));
-  assert.deepEqual(Array.from(await source.search('x', 1)), []);
+  await assert.rejects(source.search('x', 1), /210.*請到官網更新/);
 });
 
 // ---------- detail ----------
@@ -239,8 +239,8 @@ test('a broken search response yields no items', async () => {
 test('detail reads title, cover, description and chapters', async () => {
   const source = extension();
   const chapters = { default: { name: '默認', count: 2, chapters: [
-    { type: 1, name: '第02話', id: 'bbbbbbbb-0000-0000-0000-000000000002' },
     { type: 1, name: '第01話', id: 'aaaaaaaa-0000-0000-0000-000000000001' },
+    { type: 1, name: '第02話', id: 'bbbbbbbb-0000-0000-0000-000000000002' },
   ] } };
   routes(source, (url) => {
     if (url.endsWith('/comic/example')) return detailPage({ key: 'example', title: '示例作品', chapters: [{ id: 'fallback-id', name: '最新話' }] });
@@ -254,23 +254,20 @@ test('detail reads title, cover, description and chapters', async () => {
   assert.match(detail.desc, /這是一段簡介/);
   assert.match(detail.desc, /愛情/);
   assert.equal(detail.episodes[0].urls.length, 2);
-  // newest first from the site becomes oldest first for the app
+  // Preserve the actual website order: oldest first.
   assert.equal(detail.episodes[0].urls[0].name, '第01話');
   assert.equal(detail.episodes[0].urls[1].name, '第02話');
   assert.match(detail.episodes[0].urls[0].url, /chapter\/aaaaaaaa-0000/);
 });
 
-test('detail falls back to the page links when the list is withheld', async () => {
+test('an empty directory is not replaced with a misleading single latest chapter', async () => {
   const source = extension();
   routes(source, (url) => {
     if (url.endsWith('/comic/example')) return detailPage({ key: 'example', chapters: [{ id: '4bd05882-c7bc-11e8-881a-024352452ce0', name: '最新' }] });
     if (url.includes('/comicdetail/')) return chapterListPayload({ default: { name: '默認', count: 0, chapters: [] } });
     return undefined;
   });
-  const detail = await source.detail('/comic/example');
-  assert.equal(detail.episodes[0].urls.length, 1);
-  assert.equal(detail.episodes[0].urls[0].name, '最新話');
-  assert.match(detail.episodes[0].urls[0].url, /4bd05882-c7bc/);
+  await assert.rejects(source.detail('/comic/example'), /章節列表為空.*網絡出口/);
 });
 
 test('detail reports the api bot check instead of showing an empty shelf', async () => {
@@ -280,10 +277,10 @@ test('detail reports the api bot check instead of showing an empty shelf', async
     if (url.includes('/comicdetail/')) return '{"code":210,"message":"請到官網更新最新APP"}';
     return undefined;
   });
-  await assert.rejects(source.detail('/comic/example'), /沒有可閱讀的章節/);
+  await assert.rejects(source.detail('/comic/example'), /210.*請到官網更新最新APP/);
 });
 
-test('detail sends the dnt header and validates the url first', async () => {
+test('detail sends the website dnts header and validates the url first', async () => {
   const source = extension();
   const log = routes(source, (url) => {
     if (url.endsWith('/comic/example')) return detailPage({ key: 'example', chapters: [{ id: 'aaaaaaaa-0000-0000-0000-000000000001', name: '第01話' }] });
@@ -292,7 +289,8 @@ test('detail sends the dnt header and validates the url first', async () => {
   });
   await source.detail('/comic/example');
   const listCall = log.find((entry) => entry.url.includes('/comicdetail/'));
-  assert.equal(listCall.options.headers.dnt, '9');
+  assert.equal(listCall.options.headers.dnts, '9');
+  assert.equal(listCall.options.headers.dnt, undefined);
   assert.match(String(listCall.options.headers.Accept), /json/);
 
   source.request = async () => { throw new Error('should not be called'); };
@@ -372,19 +370,7 @@ test('a page without the inline array falls back to markup cards', () => {
   assert.equal(items.length, 1);
 });
 
-// ---------- login is deliberately not used ----------
-
-test('base64 matches the standard alphabet', () => {
-  const source = extension();
-  for (const [input, expected] of [
-    ['a', 'YQ=='],
-    ['ab', 'YWI='],
-    ['abc', 'YWJj'],
-    ['a-123456', 'YS0xMjM0NTY='],
-  ]) {
-    assert.equal(source.base64(input), expected, `base64 of ${input}`);
-  }
-});
+// ---------- public requests and caching ----------
 
 test('page requests stay anonymous even when account settings are filled in', async () => {
   const source = extension();
@@ -398,19 +384,12 @@ test('page requests stay anonymous even when account settings are filled in', as
   const detail = await source.detail('/comic/example');
   assert.equal(detail.episodes[0].urls.length, 1);
 
-  // measured: sending the token turns a full chapter list into an empty one, so
-  // neither a cookie nor an authorization header may ride along
+  // Public reading works without an account; do not send old stored credentials.
   for (const entry of log) {
     assert.equal(entry.options.headers.Authorization, undefined, `no auth header on ${entry.url}`);
     assert.equal(entry.options.headers.Cookie, undefined, `no cookie on ${entry.url}`);
   }
   assert.ok(!log.some((entry) => entry.url.includes('/api/v1/login')), 'no login call is made');
-});
-
-test('authHeaders returns nothing to attach', async () => {
-  const source = extension();
-  source.getSetting = async () => 'irrelevant';
-  assert.deepEqual(JSON.parse(JSON.stringify(await source.authHeaders())), {});
 });
 
 test('pages are cached so a slow mirror is not hit twice', async () => {
@@ -424,4 +403,57 @@ test('pages are cached so a slow mirror is not hit twice', async () => {
   clock.now += 61000;
   await source.latest(1, '0');
   assert.ok(log.length > first, 'an expired cache must be refreshed');
+});
+
+
+test('a withheld directory can be retried immediately after switching network', async () => {
+  const source = extension();
+  let count = 0;
+  routes(source, (url) => {
+    if (url.endsWith('/comic/example')) return detailPage({ key: 'example' });
+    if (url.includes('/comicdetail/')) {
+      count += 1;
+      return chapterListPayload({ default: { name: '默認', chapters: count === 1 ? [] : [{ id: 'chapter-1', name: '第01話' }] } });
+    }
+  });
+  await assert.rejects(source.detail('/comic/example'), /網絡出口/);
+  const result = await source.detail('/comic/example');
+  assert.equal(result.episodes[0].urls[0].name, '第01話');
+  assert.equal(count, 2);
+});
+
+test('a withheld reader is not cached and never claims login is mandatory', async () => {
+  const source = extension();
+  let count = 0;
+  const log = routes(source, (url) => {
+    if (url.includes('/chapter/')) {
+      count += 1;
+      return chapterPage({ encrypted: count === 1 ? '' : pagesPayload(3) });
+    }
+  });
+  await assert.rejects(source.watch('/comic/example/chapter/chapter-1'), (error) => {
+    assert.match(error.message, /網絡出口/);
+    assert.doesNotMatch(error.message, /只對已登入|code 210/);
+    return true;
+  });
+  assert.equal((await source.watch('/comic/example/chapter/chapter-1')).urls.length, 3);
+  assert.equal(count, 2);
+  assert.ok(!log.some((entry) => entry.url.endsWith('/comic/example')), 'reader needs no extra detail request');
+  for (const call of log) {
+    assert.equal(call.options.headers.dnt, undefined);
+    assert.equal(call.options.headers.dnts, undefined);
+  }
+});
+
+test('chapters keep group order and remove duplicate chapter ids', async () => {
+  const source = extension();
+  routes(source, (url) => {
+    if (url.endsWith('/comic/example')) return detailPage();
+    if (url.includes('/comicdetail/')) return chapterListPayload({
+      editionA: { chapters: [{ id: 'vol-1', name: '1卷' }, { id: 'vol-2', name: '2卷' }] },
+      editionB: { chapters: [{ id: 'vol-2', name: '2卷' }, { id: 'extra-1', name: '番外' }] },
+    });
+  });
+  const result = await source.detail('/comic/example');
+  assert.deepEqual(Array.from(result.episodes[0].urls, (item) => item.name), ['1卷', '2卷', '番外']);
 });

@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         拷貝漫畫
-// @version      v1.2.0
+// @version      v1.2.1
 // @author       FusionReader
 // @lang         zh-tw
 // @license      MIT
@@ -12,31 +12,12 @@
 // @network      auto
 // ==/MiruExtension==
 //
-// 拷貝漫畫 (copymanga / mangacopy). The site has no api documentation worth
-// using and its json api answers a bot check (`code 210`, "you or someone near
-// you installed a cracked client") once it dislikes the traffic, so everything
-// here runs on the public html site and decrypts what that site encrypts:
-//
-//   listing   : /newest?offset=&limit=      (60 per page, paged by offset)
-//   filters   : /comics?ordering=-datetime_updated&offset=&limit=&region=&status=&theme=
-//   search    : /api/kb/web/searchcl/comics?offset&platform=2&limit&q&q_type  (json)
-//   detail    : /comic/<path_word>          (title, cover, tags, <span id="dnt">)
-//   chapters  : /comicdetail/<path_word>/chapters  (json, `results` is encrypted)
-//   reader    : /comic/<path_word>/chapter/<uuid>  (`var contentKey = '…'`, encrypted)
-//
-// The encryption is AES-128-CBC with PKCS7 padding where the first 16 characters
-// of the payload are the iv and the rest is hex cipher text. The key ships in the
-// page itself as `var ccz = '…'` (detail) and `var cct = '…'` (reader) — the same
-// constant on every mirror checked. QuickJS has no crypto module, so the cipher
-// below is implemented in plain javascript; it is checked against FIPS-197 and
-// against node's aes-128-cbc in tests/copymanga_test.mjs.
-//
-// Two mirrors are enough to keep the site reachable when one is blocked; the
-// first that answers becomes the entry for the session.
-//
-// The chapter list and the reader need the `dnt` value of the detail page as a
-// request header; without it the site answers with an empty chapter list and an
-// empty contentKey, which is what the plugin reports as an empty shelf.
+// Public website adapter. No account is required for the tested public reader.
+// Some network exits receive HTTP 200 with empty chapters/contentKey; this is
+// a site/network response, not proof that login or a newer client is required.
+// Chapter requests use the website's `dnts` header; reader requests do not.
+// AES-128-CBC: 16 ASCII IV characters followed by hex ciphertext (PKCS7).
+// The key is supplied by the page as ccz/cct, with a fallback for old pages.
 
 const ENTRY_CANDIDATES = [
   'https://www.copy5000.com',
@@ -282,11 +263,6 @@ export default class extends Extension {
     this.state();
   }
 
-  // A token is not what this source needs: measured 2026-11-04, the web
-  // endpoints that carry the chapter list and the reader ignore it and answer an
-  // empty payload when one is present. The login helpers below are kept small and
-  // unused so a future site change only has to wire them back into authHeaders().
-
   // the cipher lives at module scope; this mirrors it on the class so the
   // behaviour can be exercised directly (see tests/copymanga_test.mjs)
   decryptPayload(payload, keyText) {
@@ -348,114 +324,6 @@ export default class extends Extension {
     const value = parseInt(raw, 10);
     if (value < 1) throw new Error('無效的頁碼：' + page);
     return value;
-  }
-
-  // ---------- login ----------
-
-  // The site hands out a token to a logged in client and serves the chapter list
-  // and the reader pages to it; anonymous clients get an empty list and an empty
-  // contentKey. The form is the site's own: the password travels as
-  // base64("<plain>-<salt>") with a six digit salt taken from the clock.
-  async credentials() {
-    this.state();
-    if (this._credentials !== undefined) return this._credentials;
-    let username = '';
-    let password = '';
-    try {
-      username = String((await this.getSetting('username')) || '').trim();
-      password = String((await this.getSetting('password')) || '');
-    } catch (error) {
-      username = '';
-      password = '';
-    }
-    this._credentials = username && password ? { username, password } : null;
-    return this._credentials;
-  }
-
-  async token() {
-    this.state();
-    if (this._token) return this._token;
-    if (this._tokenPending) return this._tokenPending;
-    const stored = await this.getSetting('token').catch(() => '');
-    if (stored) {
-      this._token = String(stored);
-      return this._token;
-    }
-    const credentials = await this.credentials();
-    if (!credentials) return '';
-
-    this._tokenPending = (async () => {
-      const salt = (Date.now() % 900000) + 100000;
-      const encoded = this.base64(`${credentials.password}-${salt}`);
-      const body = [
-        `username=${encodeURIComponent(credentials.username)}`,
-        `password=${encodeURIComponent(encoded)}`,
-        `salt=${salt}`,
-        'platform=2',
-        'version=1.0.0',
-        'source=copyweb',
-      ].join('&');
-      const site = await this.entry();
-      const raw = await this.requestText(site + '/api/v1/login', {
-        method: 'POST',
-        data: body,
-        headers: {
-          ...this.pageHeaders(),
-          'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-          'X-Requested-With': 'XMLHttpRequest',
-          Accept: 'application/json',
-        },
-        allowErrorStatus: true,
-        timeoutMs: REQUEST_TIMEOUT_MS,
-        retry: 1,
-      });
-      let payload;
-      try {
-        payload = JSON.parse(raw);
-      } catch (error) {
-        throw new Error('登入回應無法解析，請稍後再試。');
-      }
-      const issued = payload && payload.results && payload.results.token;
-      if (!issued) {
-        const message = String((payload && payload.message) || '').trim();
-        throw new Error(`登入失敗：${message || '站點未返回 token'}。請在設定中檢查帳號密碼。`);
-      }
-      this._token = String(issued);
-      await this.setSetting('token', this._token).catch(() => {});
-      return this._token;
-    })();
-
-    try {
-      return await this._tokenPending;
-    } finally {
-      this._tokenPending = null;
-    }
-  }
-
-  // Measured 2026-11-04: the web endpoints the plugin uses do NOT accept the
-  // account token. Sending it turns a 402 chapter list into an empty one
-  // (`Cookie: token=…`, `Authorization: Token …`, both — same result), so the
-  // page requests stay anonymous on purpose. Kept as a hook in case the site
-  // changes its mind; `token()` is still what the optional login setting uses.
-  async authHeaders() {
-    return {};
-  }
-
-  // base64 of a short utf-8 string (btoa is not guaranteed to exist in QuickJS)
-  base64(text) {
-    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-    const bytes = textToBytes(String(text));
-    let out = '';
-    for (let i = 0; i < bytes.length; i += 3) {
-      const b0 = bytes[i];
-      const b1 = i + 1 < bytes.length ? bytes[i + 1] : 0;
-      const b2 = i + 2 < bytes.length ? bytes[i + 2] : 0;
-      out += alphabet[b0 >> 2];
-      out += alphabet[((b0 & 0x03) << 4) | (b1 >> 4)];
-      out += i + 1 < bytes.length ? alphabet[((b1 & 0x0f) << 2) | (b2 >> 6)] : '=';
-      out += i + 2 < bytes.length ? alphabet[b2 & 0x3f] : '=';
-    }
-    return out;
   }
 
   pathWord(url) {
@@ -557,7 +425,7 @@ export default class extends Extension {
   async fetch(path, headers) {
     const target = /^https?:\/\//i.test(path) ? String(path).replace(/^https?:\/\/[^/]+/i, '') : path;
     const site = await this.entry();
-    const merged = { ...this.pageHeaders(), ...(await this.authHeaders()), ...(headers || {}) };
+    const merged = { ...this.pageHeaders(), ...(headers || {}) };
     // an explicit timeout: the runtime default is short for a 70 kb page, and a
     // silent truncation arrives here looking like an empty body
     const options = { headers: merged, allowErrorStatus: true, timeoutMs: REQUEST_TIMEOUT_MS, retry: 1 };
@@ -625,8 +493,13 @@ export default class extends Extension {
     const number = this.pageNumber(page);
     const offset = (number - 1) * SEARCH_LIMIT;
     const path = `/api/kb/web/searchcl/comics?offset=${offset}&platform=2&limit=${SEARCH_LIMIT}&q=${encodeURIComponent(keyword)}&q_type=`;
-    const body = await this.page(path, { Accept: 'application/json' });
-    return this.searchCards(body);
+    const headers = { Accept: 'application/json' };
+    try {
+      return this.searchCards(await this.page(path, headers));
+    } catch (error) {
+      this.forgetPage(path, headers);
+      throw error;
+    }
   }
 
   searchCards(body) {
@@ -634,7 +507,10 @@ export default class extends Extension {
     try {
       payload = JSON.parse(body);
     } catch (error) {
-      return [];
+      throw new Error('搜尋回應無法解析，請檢查網絡或稍後重試。');
+    }
+    if (!payload || payload.code !== 200) {
+      throw new Error(`搜尋失敗（${payload && payload.code !== undefined ? payload.code : '未知狀態'}）：${String(payload && payload.message || '站點沒有返回有效資料').slice(0, 160)}`);
     }
     const list = (payload && payload.results && payload.results.list) || [];
     const items = [];
@@ -804,11 +680,7 @@ export default class extends Extension {
     const tags = [...new Set([...html.matchAll(/comicParticulars-tag[^>]*>[\s\S]{0,80}?<a\b[^>]*>([^<]{0,24})</gi)].map((m) => m[1].trim()))].filter((tag) => tag);
     const desc = [this.textOf(intro), tags.length ? '標籤：' + tags.join('、') : ''].filter((part) => part).join('\n\n');
 
-    const chapters = await this.chapters(target.key, dnt, cryptoKey, html);
-    if (!chapters.length) {
-      throw new Error('這個作品目前沒有可閱讀的章節。若瀏覽器能看而這裡為空，通常是站點對匿名請求做了限制，請稍後再試。');
-    }
-
+    const chapters = await this.chapters(target.key, dnt, cryptoKey);
     return {
       title,
       cover,
@@ -817,48 +689,52 @@ export default class extends Extension {
     };
   }
 
-  // The chapter list endpoint answers encrypted json. An empty answer means the
-  // site withheld the list (see the note at the top), so the detail page links
-  // are used as a fallback instead of failing outright.
-  async chapters(key, dnt, cryptoKey, detailHtml) {
-    const chapters = [];
-    const seen = new Set();
-    const add = (uuid, name) => {
-      const id = String(uuid || '').trim();
-      if (!id || seen.has(id)) return;
-      seen.add(id);
-      chapters.push({ name: String(name || '').trim() || `第 ${chapters.length + 1} 話`, url: `/comic/${key}/chapter/${id}` });
-    };
+  unavailableMessage(subject) {
+    return `${subject}為空：站點未返回漫畫內容，部分網絡出口可能受限。請先確認瀏覽器能閱讀，再切換到可閱讀的代理節點後重試；此提示不代表必須登入。`;
+  }
 
+  forgetPage(path, headers) {
+    this.state();
+    this._pages.delete(`${headers && headers.Accept ? headers.Accept : ''}|${path}`);
+  }
+
+  // The website returns chapters in reading order. Retain its group order too;
+  // reversing the whole list put the newest chapter before the first volume.
+  async chapters(key, dnt, cryptoKey) {
+    const path = `/comicdetail/${key}/chapters`;
+    const headers = { Accept: 'application/json', dnts: dnt || '2' };
     try {
-      const body = await this.page(`/comicdetail/${key}/chapters`, { Accept: 'application/json', dnt });
-      const payload = JSON.parse(body);
-      if (payload && payload.code === 210) {
-        throw new Error(String(payload.message || '').slice(0, 60));
+      const body = await this.page(path, headers);
+      let payload;
+      try { payload = JSON.parse(body); }
+      catch (error) { throw new Error('章節列表回應無法解析，請檢查網絡或稍後重試。'); }
+      if (!payload || payload.code !== 200) {
+        throw new Error(`章節列表請求失敗（${payload && payload.code !== undefined ? payload.code : '未知狀態'}）：${String(payload && payload.message || '站點沒有返回有效資料').slice(0, 160)}`);
       }
-      const plain = decryptPayload(payload && payload.results, cryptoKey);
-      const data = JSON.parse(plain);
-      const groups = Object.values((data && data.groups) || {});
-      // the site lists newest first; the app shows the list in array order
-      const flat = [];
-      for (const group of groups) {
+      let data;
+      try { data = JSON.parse(decryptPayload(payload.results, cryptoKey)); }
+      catch (error) { throw new Error('章節列表解密失敗，可能站點已改版。'); }
+      if (data && data.build && data.build.path_word && data.build.path_word !== key) {
+        throw new Error('站點返回了其他作品的章節，請稍後重試。');
+      }
+      const chapters = [];
+      const seen = new Set();
+      for (const group of Object.values((data && data.groups) || {})) {
         for (const chapter of (group && group.chapters) || []) {
-          flat.push({ type: chapter.type, name: chapter.name, id: chapter.id });
+          const id = String(chapter.id || '').trim();
+          if (!/^[\w-]+$/.test(id) || seen.has(id)) continue;
+          seen.add(id);
+          chapters.push({ name: String(chapter.name || '').trim() || `第 ${chapters.length + 1} 話`, url: `/comic/${key}/chapter/${id}` });
         }
       }
-      flat.reverse();
-      for (const chapter of flat) add(chapter.id, chapter.name);
+      if (!chapters.length) throw new Error(this.unavailableMessage('章節列表'));
+      return chapters;
     } catch (error) {
-      // fall through to the html links below
+      // A network switch must be able to retry immediately; never retain a
+      // withheld/invalid directory or silently replace it with one latest link.
+      this.forgetPage(path, headers);
+      throw error;
     }
-
-    if (!chapters.length) {
-      const pattern = new RegExp(`/comic/${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/chapter/([\\w-]+)`, 'g');
-      const html = detailHtml || '';
-      for (const match of html.matchAll(pattern)) add(match[1], '');
-      if (chapters.length) chapters[chapters.length - 1].name = '最新話';
-    }
-    return chapters;
   }
 
   // ---------- watch ----------
@@ -873,23 +749,27 @@ export default class extends Extension {
 
   async watch(url) {
     const target = this.chapterTarget(url);
-    const { dnt, key: cryptoKey } = await this.dntKey(`/comic/${target.key}`);
-    const html = await this.page(target.path, { dnt });
+    const html = await this.page(target.path);
     const contentKey = (html.match(/var contentKey = '([^']*)'/) || [])[1] || '';
-    const pageKey = (html.match(/var cct = '([^']*)'/) || [])[1] || cryptoKey;
+    const pageKey = (html.match(/var cct = '([^']*)'/) || [])[1] || FALLBACK_KEY;
     if (!contentKey) {
-      throw new Error('這一話的頁面資料為空：站點只對已登入的瀏覽器返回內容，而它現在的登入接口對本客戶端返回 code 210（請更新 App 的提示）。目錄與搜尋仍可正常使用。');
+      this.forgetPage(target.path);
+      throw new Error(this.unavailableMessage('這一話的頁面資料'));
     }
     let list;
     try {
       list = JSON.parse(decryptPayload(contentKey, pageKey));
     } catch (error) {
+      this.forgetPage(target.path);
       throw new Error('頁面資料解析失敗，可能站點已改版。');
     }
     const urls = (Array.isArray(list) ? list : [])
       .map((item) => this.absolute(item && item.url))
       .filter((pageUrl) => /^https?:\/\//i.test(pageUrl));
-    if (!urls.length) throw new Error('這一話沒有取到頁面圖片。');
+    if (!urls.length) {
+      this.forgetPage(target.path);
+      throw new Error(this.unavailableMessage('這一話的圖片列表'));
+    }
     return { urls };
   }
 }
