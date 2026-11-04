@@ -323,7 +323,7 @@ test('watch explains an empty contentKey instead of returning nothing', async ()
     if (url.endsWith('/comic/example')) return detailPage({ key: 'example' });
     return undefined;
   });
-  await assert.rejects(source.watch('/comic/example/chapter/abc'), /沒有取到頁面內容/);
+  await assert.rejects(source.watch('/comic/example/chapter/abc'), /頁面資料為空/);
 });
 
 test('watch rejects urls it cannot parse', () => {
@@ -372,7 +372,7 @@ test('a page without the inline array falls back to markup cards', () => {
   assert.equal(items.length, 1);
 });
 
-// ---------- login ----------
+// ---------- login is deliberately not used ----------
 
 test('base64 matches the standard alphabet', () => {
   const source = extension();
@@ -386,66 +386,31 @@ test('base64 matches the standard alphabet', () => {
   }
 });
 
-test('login posts the site form and keeps the token', async () => {
-  const source = extension();
-  const log = routes(source, (url) => {
-    if (url.includes('/api/v1/login')) return JSON.stringify({ code: 200, message: 'ok', results: { token: 'tok-123' } });
-    if (url.endsWith('/comic/example')) return detailPage({ key: 'example', chapters: [{ id: 'aaaaaaaa-0000-0000-0000-000000000001', name: '第01話' }] });
-    if (url.includes('/comicdetail/')) return chapterListPayload({ default: { name: '默認', count: 1, chapters: [{ type: 1, name: '第01話', id: 'aaaaaaaa-0000-0000-0000-000000000001' }] } });
-    return undefined;
-  });
-  source.getSetting = async (key) => (key === 'username' ? 'someone@example.com' : key === 'password' ? 'p@ss' : '');
-  const saved = [];
-  source.setSetting = async (key, value) => { saved.push([key, value]); };
-
-  await source.detail('/comic/example');
-
-  const login = log.find((entry) => entry.url.includes('/api/v1/login'));
-  assert.ok(login, 'a login request must be sent once credentials exist');
-  assert.equal(login.options.method, 'POST');
-  assert.match(String(login.options.headers['Content-Type']), /x-www-form-urlencoded/);
-  const form = String(login.options.data);
-  assert.match(form, /^username=someone%40example\.com&password=/);
-  assert.match(form, /&salt=\d{6}&platform=2&version=1\.0\.0&source=copyweb$/);
-  // the password travels as base64("<plain>-<salt>")
-  const encoded = decodeURIComponent((form.match(/password=([^&]+)/) || [])[1] || '');
-  const salt = (form.match(/salt=(\d+)/) || [])[1];
-  assert.equal(Buffer.from(encoded, 'base64').toString('utf8'), `p@ss-${salt}`);
-
-  // the token rides on the page requests that follow
-  const chapterCall = log.find((entry) => entry.url.includes('/comicdetail/'));
-  assert.equal(chapterCall.options.headers.Authorization, 'Token tok-123');
-  assert.equal(chapterCall.options.headers.Cookie, 'token=tok-123');
-  assert.deepEqual(saved, [['token', 'tok-123']]);
-});
-
-test('a failed login does not break browsing', async () => {
-  const source = extension();
-  const log = routes(source, (url) => {
-    if (url.includes('/api/v1/login')) return '{"code":210,"message":"用戶登錄失敗:該賬戶不存在.","results":null}';
-    if (url.endsWith('/comic/example')) return detailPage({ key: 'example', chapters: [{ id: 'aaaaaaaa-0000-0000-0000-000000000001', name: '第01話' }] });
-    if (url.includes('/comicdetail/')) return chapterListPayload({ default: { name: '默認', count: 0, chapters: [] } });
-    return undefined;
-  });
-  source.getSetting = async (key) => (key === 'username' ? 'someone' : key === 'password' ? 'wrong' : '');
-
-  const items = await source.latest(1, '0');
-  assert.ok(items.length >= 1, 'the listing must still work');
-  assert.ok(log.some((entry) => entry.url.includes('/api/v1/login')));
-});
-
-test('a stored token is reused without logging in again', async () => {
+test('page requests stay anonymous even when account settings are filled in', async () => {
   const source = extension();
   const log = routes(source, (url) => {
     if (url.endsWith('/comic/example')) return detailPage({ key: 'example', chapters: [{ id: 'aaaaaaaa-0000-0000-0000-000000000001', name: '第01話' }] });
     if (url.includes('/comicdetail/')) return chapterListPayload({ default: { name: '默認', count: 1, chapters: [{ type: 1, name: '第01話', id: 'aaaaaaaa-0000-0000-0000-000000000001' }] } });
     return undefined;
   });
-  source.getSetting = async (key) => (key === 'token' ? 'tok-stored' : '');
-  await source.detail('/comic/example');
-  assert.ok(!log.some((entry) => entry.url.includes('/api/v1/login')), 'no login call when a token is stored');
-  const chapterCall = log.find((entry) => entry.url.includes('/comicdetail/'));
-  assert.equal(chapterCall.options.headers.Authorization, 'Token tok-stored');
+  source.getSetting = async (key) => (key === 'username' ? 'someone' : key === 'password' ? 'p@ss' : '');
+
+  const detail = await source.detail('/comic/example');
+  assert.equal(detail.episodes[0].urls.length, 1);
+
+  // measured: sending the token turns a full chapter list into an empty one, so
+  // neither a cookie nor an authorization header may ride along
+  for (const entry of log) {
+    assert.equal(entry.options.headers.Authorization, undefined, `no auth header on ${entry.url}`);
+    assert.equal(entry.options.headers.Cookie, undefined, `no cookie on ${entry.url}`);
+  }
+  assert.ok(!log.some((entry) => entry.url.includes('/api/v1/login')), 'no login call is made');
+});
+
+test('authHeaders returns nothing to attach', async () => {
+  const source = extension();
+  source.getSetting = async () => 'irrelevant';
+  assert.deepEqual(JSON.parse(JSON.stringify(await source.authHeaders())), {});
 });
 
 test('pages are cached so a slow mirror is not hit twice', async () => {

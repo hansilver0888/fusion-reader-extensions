@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         拷貝漫畫
-// @version      v1.1.0
+// @version      v1.2.0
 // @author       FusionReader
 // @lang         zh-tw
 // @license      MIT
@@ -280,28 +280,12 @@ export default class extends Extension {
 
   async load() {
     this.state();
-    // The chapter list and the reader are served to logged in clients only, so
-    // an account is what makes this source readable. Both fields are optional:
-    // without them the plugin still browses and searches.
-    try {
-      await this.registerSetting({
-        key: 'username',
-        title: '帳號（手機號／信箱）',
-        type: 'input',
-        description: '可選。填寫後章節與閱讀頁才能載入；只用於在官網取得登入 token，僅保存在本機。',
-        defaultValue: '',
-      });
-      await this.registerSetting({
-        key: 'password',
-        title: '密碼',
-        type: 'password',
-        description: '僅保存在本機，用於換取登入 token。',
-        defaultValue: '',
-      });
-    } catch (error) {
-      // runtimes without a settings ui simply stay anonymous
-    }
   }
+
+  // A token is not what this source needs: measured 2026-11-04, the web
+  // endpoints that carry the chapter list and the reader ignore it and answer an
+  // empty payload when one is present. The login helpers below are kept small and
+  // unused so a future site change only has to wire them back into authHeaders().
 
   // the cipher lives at module scope; this mirrors it on the class so the
   // behaviour can be exercised directly (see tests/copymanga_test.mjs)
@@ -448,9 +432,13 @@ export default class extends Extension {
     }
   }
 
+  // Measured 2026-11-04: the web endpoints the plugin uses do NOT accept the
+  // account token. Sending it turns a 402 chapter list into an empty one
+  // (`Cookie: token=…`, `Authorization: Token …`, both — same result), so the
+  // page requests stay anonymous on purpose. Kept as a hook in case the site
+  // changes its mind; `token()` is still what the optional login setting uses.
   async authHeaders() {
-    const token = await this.token().catch(() => '');
-    return token ? { Cookie: `token=${token}`, Authorization: `Token ${token}` } : {};
+    return {};
   }
 
   // base64 of a short utf-8 string (btoa is not guaranteed to exist in QuickJS)
@@ -890,7 +878,7 @@ export default class extends Extension {
     const contentKey = (html.match(/var contentKey = '([^']*)'/) || [])[1] || '';
     const pageKey = (html.match(/var cct = '([^']*)'/) || [])[1] || cryptoKey;
     if (!contentKey) {
-      throw new Error('這一話沒有取到頁面內容，通常是站點對匿名請求做了限制，請稍後再試。');
+      throw new Error('這一話的頁面資料為空：站點只對已登入的瀏覽器返回內容，而它現在的登入接口對本客戶端返回 code 210（請更新 App 的提示）。目錄與搜尋仍可正常使用。');
     }
     let list;
     try {
