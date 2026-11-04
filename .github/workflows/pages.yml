@@ -24,6 +24,10 @@ jobs:
         run: |
           node tools/update_sonovel.mjs
           git diff --exit-code -- sources/sonovel.js
+      - name: Verify generated manga adapters
+        run: |
+          node tools/update_dm_family.mjs
+          git diff --exit-code -- sources/mangabz.js sources/dm5.js
       - run: node --test tests/*.mjs
       - run: python -m unittest discover -s tools -p 'test_*.py'
       - run: python tools/build_repository.py
