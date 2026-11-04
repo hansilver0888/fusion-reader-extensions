@@ -1,6 +1,6 @@
-// ==MiruExtension==
+﻿// ==MiruExtension==
 // @name         拷貝漫畫
-// @version      v1.0.0
+// @version      v1.0.1
 // @author       FusionReader
 // @lang         zh-tw
 // @license      MIT
@@ -366,18 +366,21 @@ export default class extends Extension {
       const failures = [];
       for (const site of ENTRY_CANDIDATES) {
         try {
-          const body = await this.requestText(site + '/newest?offset=0&limit=1', {
-            headers: { 'User-Agent': this.userAgent(), Accept: 'text/html,*/*', 'Accept-Language': 'zh-CN,zh;q=0.9' },
+          // A full page rather than limit=1: the trimmed variant is only a few
+          // kb and some hosts answer it with a shell that carries no links.
+          const body = await this.requestText(site + '/newest', {
+            headers: this.pageHeaders(),
             allowErrorStatus: true,
           });
-          if (!/\/comic\//.test(body)) {
-            failures.push(`${site} 不是預期的頁面`);
+          const problem = this.describePage(body);
+          if (problem) {
+            failures.push(`${site} ${problem}`);
             continue;
           }
           this._entry = site;
           return site;
         } catch (error) {
-          failures.push(`${site} ${String(error && error.message ? error.message : error).slice(0, 40)}`);
+          failures.push(`${site} ${String(error && error.message ? error.message : error).slice(0, 60)}`);
         }
       }
       throw new Error(`沒有可用的鏡像站點。\n${failures.join('\n')}`);
@@ -388,6 +391,31 @@ export default class extends Extension {
     } finally {
       this._entryPending = null;
     }
+  }
+
+  // Headers the site expects from a browser. aidoku notes that hosts which merge
+  // a default header suite answer a different page without them, so the full set
+  // is spelled out instead of relying on the runtime's defaults.
+  pageHeaders() {
+    return {
+      'User-Agent': this.userAgent(),
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      'Upgrade-Insecure-Requests': '1',
+    };
+  }
+
+  // Why a probe response is unusable, or '' when it looks like a listing page.
+  describePage(body) {
+    const text = String(body || '');
+    if (!text) return '空白回應';
+    if (text.length < 400) return `頁面過短（${text.length} 字元）：${text.replace(/\s+/g, ' ').slice(0, 60)}`;
+    if (/Just a moment|Attention Required|cf-bluemix|__cf_chl/i.test(text)) return '被 Cloudflare 攔截';
+    if (/請到官網更新|伺服器升級|服务器升级/.test(text)) return '站點要求更新 App';
+    if (/\/comic\/[\w-]/.test(text)) return '';
+    if (/exemptComic/.test(text)) return '';
+    const title = (text.match(/<title[^>]*>([\s\S]{0,80}?)<\/title>/i) || [])[1] || '';
+    return `不是預期的頁面${title ? `（${title.trim().slice(0, 30)}）` : ''}，長度 ${text.length}`;
   }
 
   async requestText(url, options) {
@@ -409,12 +437,7 @@ export default class extends Extension {
   async fetch(path, headers) {
     const target = /^https?:\/\//i.test(path) ? String(path).replace(/^https?:\/\/[^/]+/i, '') : path;
     const site = await this.entry();
-    const merged = {
-      'User-Agent': this.userAgent(),
-      Accept: 'text/html,*/*',
-      'Accept-Language': 'zh-CN,zh;q=0.9',
-      ...(headers || {}),
-    };
+    const merged = { ...this.pageHeaders(), ...(headers || {}) };
     try {
       return await this.requestText(site + target, { headers: merged, allowErrorStatus: true });
     } catch (error) {

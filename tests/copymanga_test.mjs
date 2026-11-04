@@ -141,7 +141,7 @@ test('the first mirror that answers becomes the entry', async () => {
   const log = routes(source, () => undefined);
   await source.latest(1, '0');
   assert.equal(source.currentSite(), 'https://www.copy5000.com');
-  assert.match(log[0].url, /^https:\/\/www\.copy5000\.com\/newest\?offset=0&limit=1$/);
+  assert.match(log[0].url, /^https:\/\/www\.copy5000\.com\/newest$/);
 });
 
 test('a broken mirror is skipped', async () => {
