@@ -1,6 +1,24 @@
-# 拷貝漫畫 v1.2.1
+# 拷貝漫畫 v1.2.2
 
-## 本次修复
+## 请求策略与 Aidoku 对照（v1.2.2）
+
+已逐项核对 [Aidoku 的请求构造](https://github.com/Aidoku-Community/sources/blob/main/sources/zh.copymanga/src/net.rs)、[目录和阅读入口](https://github.com/Aidoku-Community/sources/blob/main/sources/zh.copymanga/src/lib.rs) 以及 [宿主的验证处理](https://github.com/Aidoku/Aidoku/blob/main/Aidoku/Core/Sources/Cloudflare/CloudflareHandler.swift)。
+
+共同部分是网站 HTML/JSON 接口、Safari UA、章节 `dnts` 头和 AES 数据格式。此前本插件额外探测多个镜像、启用宿主重试，并且只错开请求开始时间；这些差异会增加请求量。新版：
+
+- 固定使用设置中指定的官方镜像，默认 copy5000.com；直接请求目标页，不额外探测或自动轮询镜像。
+- 请求头对齐参考实现的显式设置；HTML 只设置 UA，JSON 额外设置 Accept。阅读图片也带相同 UA。
+- 将完整请求串行化，上一请求结束后至少等待 1 秒；明确 `retry: false` 关闭宿主自动重试。
+- 页面缓存保留 5 分钟，最多 128 页；相同页面的并发调用合并。
+- 遇到纯文本 error、验证页或 HTTP 403/429/503 时暂停后续网页请求，至少 30 秒，429 尊重 Retry-After；提示状态码，不循环尝试。
+
+1 秒间隔与本地暂停是本插件的保守策略，不代表 Aidoku 有相同限速。Aidoku 本体还具有 WebView 验证和 Cookie 共享机制；其判定要求特定状态码、Cloudflare 响应头和验证页标记，不能据此认定纯文本 error 一定是 Cloudflare 验证。鸿蒙 Dart 请求栈与 Aidoku 的宿主环境不同，仅对齐插件无法保证出口不被网站限制。当前暂停只控制插件的网页/API 请求，不控制本体独立发出的封面和图片请求。
+
+## UA 对照测试
+
+插件设置中“请求 UA”可填 `safari`、`chrome` 或 `mobile`，默认 `safari` 与 Aidoku 插件一致。保存设置后插件会重新加载、清除本次会话缓存。选定的 UA 对网页、JSON 和阅读图片保持固定；收到 error 后不会自动轮换身份或继续请求。测试时保持节点及镜像不变，分别验证两个配置；不能仅凭更换 UA 后一次成功断言已解决风控。
+
+## v1.2.1 修复
 
 2026-11-04 对比实测：原出口可以加载列表和搜索，但普通浏览器与插件的阅读页都返回空内容。使用香港出口后，匿名请求即可读取目录与图片，无需账号。不能据此认定所有日本出口均不可用；可用性以实际节点为准。
 

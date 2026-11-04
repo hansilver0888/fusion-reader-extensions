@@ -136,29 +136,39 @@ test('a payload with the wrong key or a short body yields nothing', () => {
 
 // ---------- entry ----------
 
-test('the first mirror that answers becomes the entry', async () => {
+test('the selected mirror is requested directly without an extra probe', async () => {
   const source = extension();
   const log = routes(source, () => undefined);
   await source.latest(1, '0');
   assert.equal(source.currentSite(), 'https://www.copy5000.com');
-  assert.match(log[0].url, /^https:\/\/www\.copy5000\.com\/newest$/);
+  assert.equal(log.length, 1);
+  assert.equal(log[0].url, 'https://www.copy5000.com/newest?offset=0&limit=60');
 });
 
-test('a broken mirror is skipped', async () => {
+test('a network failure does not trigger retries or mirror polling', async () => {
   const source = extension();
-  source.request = async (url) => {
-    if (url.startsWith('https://www.copy5000.com')) throw new Error('connect timeout');
-    if (url.includes('/newest')) return newestPage([{ key: 'example', title: '示例作品' }]);
-    return undefined;
+  let calls = 0;
+  source.request = async (url, options) => {
+    calls += 1;
+    assert.equal(options.retry, false);
+    throw new Error('connect timeout');
   };
+  await assert.rejects(source.latest(1, '0'), /connect timeout/);
+  assert.equal(calls, 1);
+});
+
+test('the mirror setting is validated without probing external addresses', async () => {
+  const source = extension();
+  source.getSetting = async () => 'https://www.copy4000.com/';
+  const log = routes(source, () => undefined);
   await source.latest(1, '0');
   assert.equal(source.currentSite(), 'https://www.copy4000.com');
-});
-
-test('when every mirror fails the error names them', async () => {
-  const source = extension();
-  source.request = async () => { throw new Error('connect timeout'); };
-  await assert.rejects(source.latest(1, '0'), /沒有可用的鏡像站點/);
+  assert.equal(log.length, 1);
+  assert.match(log[0].url, /^https:\/\/www\.copy4000\.com\/newest\?/);
+  const invalid = extension();
+  invalid.getSetting = async () => 'https://unrelated.invalid';
+  invalid.request = async () => { throw new Error('must not request'); };
+  await assert.rejects(invalid.latest(1, '0'), /官方鏡像/);
 });
 
 // ---------- listings ----------
@@ -400,7 +410,7 @@ test('pages are cached so a slow mirror is not hit twice', async () => {
   const first = log.length;
   await source.latest(1, '0');
   assert.equal(log.length, first, 'the listing must come from cache');
-  clock.now += 61000;
+  clock.now += 300001;
   await source.latest(1, '0');
   assert.ok(log.length > first, 'an expired cache must be refreshed');
 });
@@ -456,4 +466,109 @@ test('chapters keep group order and remove duplicate chapter ids', async () => {
   });
   const result = await source.detail('/comic/example');
   assert.deepEqual(Array.from(result.episodes[0].urls, (item) => item.name), ['1卷', '2卷', '番外']);
+});
+
+
+test('requests are serial and leave a full gap after the previous response', async () => {
+  const clock = { now: 1000 };
+  const source = extension(clock);
+  source.sleep = async (ms) => { clock.now += ms; };
+  const calls = [];
+  let release;
+  source.request = async (url, options) => {
+    calls.push({ url, time: clock.now, retry: options.retry });
+    if (calls.length === 1) await new Promise((resolve) => { release = resolve; });
+    return '<html>ok</html>';
+  };
+  const first = source.requestText('https://example.invalid/one');
+  const second = source.requestText('https://example.invalid/two');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls.length, 1, 'second request must wait for first response');
+  clock.now += 250;
+  const completedAt = clock.now;
+  release();
+  await Promise.all([first, second]);
+  assert.equal(calls.length, 2);
+  assert.ok(calls[1].time - completedAt >= 1000);
+  assert.ok(calls.every((call) => call.retry === false));
+});
+
+test('literal error pauses requests without polling other mirrors', async () => {
+  const clock = { now: 1000 };
+  const source = extension(clock);
+  let calls = 0;
+  source.request = async () => {
+    calls += 1;
+    return calls === 1 ? { status: 200, body: 'error', headers: {} } : newestPage([{ key: 'example', title: '示例作品' }]);
+  };
+  await assert.rejects(source.latest(1, '0'), /HTTP 200.*error/);
+  await assert.rejects(source.latest(1, '0'), /等待.*秒/);
+  assert.equal(calls, 1);
+  clock.now += 30001;
+  assert.equal((await source.latest(1, '0')).length, 1);
+  assert.equal(calls, 2);
+});
+
+test('HTTP 429 honors Retry-After and request metadata unwraps JSON', async () => {
+  const clock = { now: 1000 };
+  const source = extension(clock);
+  let calls = 0;
+  source.request = async (url, options) => {
+    calls += 1;
+    assert.equal(options.responseMetadata, true);
+    return calls === 1 ? { status: 429, body: 'busy', headers: { 'retry-after': ['120'] } } : { status: 200, body: { code: 200, results: { list: [] } }, headers: {} };
+  };
+  await assert.rejects(source.search('x', 1), /HTTP 429/);
+  clock.now += 60000;
+  await assert.rejects(source.search('x', 1), /等待.*秒/);
+  assert.equal(calls, 1);
+  clock.now += 60001;
+  assert.equal((await source.search('x', 1)).length, 0);
+  assert.equal(calls, 2);
+});
+
+test('HTML uses the source UA and reader images inherit the same header', async () => {
+  const source = extension();
+  const log = routes(source, (url) => url.includes('/chapter/') ? chapterPage({ encrypted: pagesPayload(2) }) : undefined);
+  const result = await source.watch('/comic/example/chapter/chapter-1');
+  assert.deepEqual(Object.keys(source.pageHeaders()), ['User-Agent']);
+  assert.equal(result.headers['User-Agent'], source.userAgent());
+  assert.equal(log.length, 1);
+  assert.equal(log[0].options.headers['Upgrade-Insecure-Requests'], undefined);
+});
+
+test('the fixed mirror setting registers without a website request', async () => {
+  const source = extension();
+  const settings = [];
+  source.registerSetting = async (setting) => settings.push(setting);
+  source.request = async () => { throw new Error('load must not access website'); };
+  await source.load();
+  assert.equal(settings.length, 2);
+  assert.equal(settings[0].key, 'site');
+});
+
+
+test('UA profiles are explicit settings and stay fixed across HTML and reader images', async () => {
+  const source = extension();
+  source.registerSetting = async () => {};
+  source.getSetting = async (key) => key === 'userAgent' ? 'mobile' : '';
+  const log = routes(source, (url) => url.includes('/chapter/') ? chapterPage({ encrypted: pagesPayload(2) }) : undefined);
+  await source.load();
+  const stream = await source.watch('/comic/example/chapter/chapter-1');
+  assert.match(log[0].options.headers['User-Agent'], /Android.*Mobile Safari/);
+  assert.equal(stream.headers['User-Agent'], log[0].options.headers['User-Agent']);
+});
+
+test('a rejection never changes the selected UA or adds a hidden second request', async () => {
+  const source = extension();
+  source.registerSetting = async () => {};
+  source.getSetting = async (key) => key === 'userAgent' ? 'chrome' : '';
+  const agents = [];
+  source.request = async (url, options) => { agents.push(options.headers['User-Agent']); return 'error'; };
+  await source.load();
+  await assert.rejects(source.latest(1, '0'), /拒絕/);
+  await assert.rejects(source.latest(1, '0'), /等待/);
+  assert.equal(agents.length, 1);
+  assert.match(agents[0], /Windows.*Chrome/);
+  assert.equal(source.userAgent(), agents[0]);
 });

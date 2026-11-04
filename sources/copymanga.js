@@ -1,6 +1,6 @@
 // ==MiruExtension==
 // @name         拷貝漫畫
-// @version      v1.2.1
+// @version      v1.2.2
 // @author       FusionReader
 // @lang         zh-tw
 // @license      MIT
@@ -23,15 +23,27 @@ const ENTRY_CANDIDATES = [
   'https://www.copy5000.com',
   'https://www.copy4000.com',
   'https://www.copy3000.com',
+  'https://copy3000.com',
   'https://www.2026copy.com',
-  'https://www.mangacopy.com',
+  'https://2026copy.com',
+  'https://www.2025copy.com',
+  'https://2025copy.com',
+  'https://www.copy20.com',
+  'https://copy20.com',
 ];
+const USER_AGENTS = {
+  safari: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0.1 Safari/605.1.15',
+  chrome: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  mobile: 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36',
+};
 const FALLBACK_KEY = '0p0zzpvv.nmn.oop';
 const PAGE_LIMIT = 60;
 const SEARCH_LIMIT = 12;
 const FILTER_LIMIT = 50;
-const PAGE_GAP_MS = 300;
-const PAGE_CACHE_MS = 60000;
+const PAGE_GAP_MS = 1000;
+const PAGE_CACHE_MS = 300000;
+const PAGE_CACHE_LIMIT = 128;
+const REJECT_PAUSE_MS = 30000;
 const REQUEST_TIMEOUT_MS = 25000;
 
 // Browsing channels. `theme` is the site's own genre id, kept empty for the
@@ -251,7 +263,8 @@ export default class extends Extension {
     if (!this._pages) {
       this._pages = new Map();
       this._inflight = new Map();
-      this._lastRequest = 0;
+      this._lastRequestFinished = null;
+      this._pauseUntil = 0;
       this._queue = Promise.resolve();
       this._entry = '';
       this._entryPending = null;
@@ -261,6 +274,19 @@ export default class extends Extension {
 
   async load() {
     this.state();
+    await this.registerSetting({
+      title: '鏡像站點', key: 'site', type: 'input',
+      description: '填寫官方鏡像完整網址；預設 copy5000.com，不自動輪詢鏡像。',
+      defaultValue: ENTRY_CANDIDATES[0],
+    });
+    await this.registerSetting({
+      title: '請求 UA', key: 'userAgent', type: 'input',
+      description: '填 safari、chrome 或 mobile，預設 safari（與 Aidoku 一致）。保存後重新載入。',
+      defaultValue: 'safari',
+    });
+    const profile = String(await this.getSetting('userAgent') || 'safari').trim().toLowerCase();
+    if (!Object.prototype.hasOwnProperty.call(USER_AGENTS, profile)) throw new Error('請求 UA 請填 safari、chrome 或 mobile。');
+    this._uaProfile = profile;
   }
 
   // the cipher lives at module scope; this mirrors it on the class so the
@@ -272,7 +298,7 @@ export default class extends Extension {
   // ---------- helpers ----------
 
   userAgent() {
-    return 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0.1 Safari/605.1.15';
+    return USER_AGENTS[this._uaProfile || 'safari'];
   }
 
   currentSite() {
@@ -342,100 +368,68 @@ export default class extends Extension {
   async entry() {
     this.state();
     if (this._entry) return this._entry;
-    if (this._entryPending) return this._entryPending;
-
-    this._entryPending = (async () => {
-      const failures = [];
-      for (const site of ENTRY_CANDIDATES) {
-        try {
-          // A full page rather than limit=1: the trimmed variant is only a few
-          // kb and some hosts answer it with a shell that carries no links.
-          // No allowErrorStatus here: a non-2xx answer should surface as an
-          // error with its status code, not as a short body we then call
-          // "too short". The caller turns that error into the failure note.
-          const body = await this.requestText(site + '/newest', {
-            headers: this.pageHeaders(),
-            timeoutMs: REQUEST_TIMEOUT_MS,
-            retry: 1,
-          });
-          const problem = this.describePage(body);
-          if (problem) {
-            failures.push(`${site} ${problem}`);
-            continue;
-          }
-          this._entry = site;
-          return site;
-        } catch (error) {
-          failures.push(`${site} ${String(error && error.message ? error.message : error).slice(0, 60)}`);
-        }
-      }
-      throw new Error(`沒有可用的鏡像站點。\n${failures.join('\n')}`);
-    })();
-
-    try {
-      return await this._entryPending;
-    } finally {
-      this._entryPending = null;
+    if (!this._entryPending) {
+      this._entryPending = (async () => {
+        const saved = String(await this.getSetting('site') || '').trim().replace(/\/+$/, '');
+        const site = saved || ENTRY_CANDIDATES[0];
+        if (!ENTRY_CANDIDATES.includes(site)) throw new Error('請填寫插件支援的官方鏡像網址，例如 https://www.copy5000.com');
+        this._entry = site;
+        return site;
+      })();
     }
+    try { return await this._entryPending; }
+    finally { this._entryPending = null; }
   }
 
-  // Headers the site expects from a browser. aidoku notes that hosts which merge
-  // a default header suite answer a different page without them, so the full set
-  // is spelled out instead of relying on the runtime's defaults.
+  // Match the source's explicit HTML request headers. JSON requests add Accept.
   pageHeaders() {
-    return {
-      'User-Agent': this.userAgent(),
-      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-      'Upgrade-Insecure-Requests': '1',
-    };
-  }
-
-  // Why a probe response is unusable, or '' when it looks like a listing page.
-  // The marker decides, not the length: a legitimate page can be short when the
-  // host trims its shell, and a long page can still be a block screen.
-  describePage(body) {
-    const text = String(body || '');
-    if (!text.trim()) return '空白回應';
-    if (/Just a moment|Attention Required|cf-bluemix|__cf_chl/i.test(text)) return '被 Cloudflare 攔截';
-    if (/請到官網更新|伺服器升級|服务器升级/.test(text)) return '站點要求更新 App';
-    if (/\/comic\/[\w-]/.test(text)) return '';
-    if (/exemptComic/.test(text)) return '';
-    const title = (text.match(/<title[^>]*>([\s\S]{0,80}?)<\/title>/i) || [])[1] || '';
-    const raw = text.replace(/\s+/g, ' ').slice(0, 80);
-    return `不是預期的頁面${title ? `（${title.trim().slice(0, 30)}）` : ''}，${text.length} 字元：${raw}`;
+    return { 'User-Agent': this.userAgent() };
   }
 
   async requestText(url, options) {
     this.state();
-    const pace = () => {
-      const wait = this._lastRequest + PAGE_GAP_MS - Date.now();
-      return wait > 0 ? this.sleep(wait) : Promise.resolve();
-    };
-    this._queue = this._queue.then(pace, pace).then(() => {
-      this._lastRequest = Date.now();
+    const task = this._queue.then(async () => {
+      const remaining = this._pauseUntil - Date.now();
+      if (remaining > 0) throw new Error(`站點暫時拒絕請求，請等待 ${Math.ceil(remaining / 1000)} 秒後重試，並確認瀏覽器可正常訪問。`);
+      if (this._lastRequestFinished !== null) {
+        const wait = this._lastRequestFinished + PAGE_GAP_MS - Date.now();
+        if (wait > 0) await this.sleep(wait);
+      }
+      let response;
+      try {
+        response = await this.request(url, {
+          ...(options || {}), timeoutMs: REQUEST_TIMEOUT_MS,
+          retry: false, allowErrorStatus: true, responseMetadata: true,
+        });
+      } finally {
+        this._lastRequestFinished = Date.now();
+      }
+      // Older hosts may return just the body; current hosts also expose status.
+      const metadata = response && typeof response === 'object' && typeof response.status === 'number' && Object.prototype.hasOwnProperty.call(response, 'body');
+      const status = metadata ? response.status : 200;
+      const body = metadata ? response.body : response;
+      const text = typeof body === 'string' ? body : JSON.stringify(body);
+      const rejected = /^\s*error\s*$/i.test(text || '') || /Just a moment|Attention Required|__cf_chl|challenge-error-title|challenge-error-text/i.test(text || '');
+      if (rejected || status === 403 || status === 429 || status === 503) {
+        const retryAfter = metadata && response.headers && response.headers['retry-after'];
+        const seconds = Number(Array.isArray(retryAfter) ? retryAfter[0] : retryAfter);
+        const pause = Number.isFinite(seconds) && seconds > 0 ? Math.min(3600000, Math.max(REJECT_PAUSE_MS, seconds * 1000)) : REJECT_PAUSE_MS;
+        this._pauseUntil = Date.now() + pause;
+        throw new Error(`站點返回拒絕回應（HTTP ${status}${rejected ? '，error／驗證頁' : ''}），已暫停自動請求，請稍後重試。`);
+      }
+      if (status < 200 || status >= 400) throw new Error(`站點請求失敗（HTTP ${status}），請稍後重試。`);
+      if (typeof text !== 'string' || !text.trim()) throw new Error('站點返回空白回應，請稍後重試。');
+      return text;
     });
-    await this._queue;
-    const text = await this.request(url, options || {});
-    return typeof text === 'string' ? text : JSON.stringify(text);
+    // Include the whole request, not only its starting timestamp, in the queue.
+    this._queue = task.then(() => {}, () => {});
+    return task;
   }
 
-  // A request against the live mirror; an absolute url keeps only its path so a
-  // stale domain from a saved entry still resolves.
   async fetch(path, headers) {
     const target = /^https?:\/\//i.test(path) ? String(path).replace(/^https?:\/\/[^/]+/i, '') : path;
     const site = await this.entry();
-    const merged = { ...this.pageHeaders(), ...(headers || {}) };
-    // an explicit timeout: the runtime default is short for a 70 kb page, and a
-    // silent truncation arrives here looking like an empty body
-    const options = { headers: merged, allowErrorStatus: true, timeoutMs: REQUEST_TIMEOUT_MS, retry: 1 };
-    try {
-      return await this.requestText(site + target, options);
-    } catch (error) {
-      this._entry = '';
-      const retrySite = await this.entry();
-      return this.requestText(retrySite + target, options);
-    }
+    return this.requestText(site + target, { headers: { ...this.pageHeaders(), ...(headers || {}) } });
   }
 
   async page(path, headers) {
@@ -447,7 +441,9 @@ export default class extends Extension {
     if (running) return running;
     const task = this.fetch(path, headers).then(
       (body) => {
+        this._pages.delete(key);
         this._pages.set(key, { time: Date.now(), body });
+        while (this._pages.size > PAGE_CACHE_LIMIT) this._pages.delete(this._pages.keys().next().value);
         this._inflight.delete(key);
         return body;
       },
@@ -770,6 +766,6 @@ export default class extends Extension {
       this.forgetPage(target.path);
       throw new Error(this.unavailableMessage('這一話的圖片列表'));
     }
-    return { urls };
+    return { urls, headers: this.pageHeaders() };
   }
 }

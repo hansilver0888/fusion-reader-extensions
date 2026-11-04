@@ -26,16 +26,25 @@ let requests = 0;
 async function request(url, options = {}, discardImage = false) {
   requests += 1;
   if (proxy) {
-    const args = ['--proxy', proxy, '--fail-with-body', '--location', '--silent', '--show-error', '--max-time', '30'];
+    const args = ['--proxy', proxy, '--location', '--silent', '--show-error', '--max-time', '30'];
+    if (!options.allowErrorStatus) args.push('--fail-with-body');
     for (const [key, value] of Object.entries(options.headers || {})) args.push('--header', key + ': ' + value);
     if (discardImage) args.push('--output', process.platform === 'win32' ? 'NUL' : '/dev/null', '--write-out', '%{http_code} %{content_type} %{size_download}');
+    if (!discardImage && options.responseMetadata) args.push('--write-out', '\n%{http_code}');
     args.push(url);
     const { stdout } = await exec('curl', args, { encoding: 'utf8', timeout: 35000, maxBuffer: 4 * 1024 * 1024, windowsHide: true });
+    if (!discardImage && options.responseMetadata) {
+      const at = stdout.lastIndexOf('\n');
+      return { body: stdout.slice(0, at), status: Number(stdout.slice(at + 1)), headers: {} };
+    }
     return stdout;
   }
   const response = await fetch(url, { headers: options.headers, redirect: 'follow', signal: AbortSignal.timeout(30000) });
-  assert.ok(response.ok, 'HTTP request failed: ' + response.status);
-  if (!discardImage) return response.text();
+  if (!options.allowErrorStatus) assert.ok(response.ok, 'HTTP request failed: ' + response.status);
+  if (!discardImage) {
+    const body = await response.text();
+    return options.responseMetadata ? { body, status: response.status, headers: Object.fromEntries(response.headers.entries()) } : body;
+  }
   const data = await response.arrayBuffer();
   return `${response.status} ${response.headers.get('content-type')} ${data.byteLength}`;
 }
@@ -61,7 +70,7 @@ try {
   for (const chapter of [chapters[0], chapters[chapters.length - 1]]) {
     const stream = await source.watch(chapter.url);
     assert.ok(stream.urls.length > 0, 'reader returned no pages');
-    const image = await request(stream.urls[0], {}, true);
+    const image = await request(stream.urls[0], { headers: stream.headers }, true);
     assert.match(image, /^200 image\//, 'first image is not readable');
     assert.ok(Number(image.split(' ').at(-1)) > 0, 'image is empty');
     report.reader.push({ chapter: chapter.name, pages: stream.urls.length, firstImage: image });
