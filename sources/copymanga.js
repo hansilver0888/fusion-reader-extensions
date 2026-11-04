@@ -1,6 +1,6 @@
-﻿// ==MiruExtension==
+// ==MiruExtension==
 // @name         拷貝漫畫
-// @version      v1.0.1
+// @version      v1.1.0
 // @author       FusionReader
 // @lang         zh-tw
 // @license      MIT
@@ -51,6 +51,7 @@ const SEARCH_LIMIT = 12;
 const FILTER_LIMIT = 50;
 const PAGE_GAP_MS = 300;
 const PAGE_CACHE_MS = 60000;
+const REQUEST_TIMEOUT_MS = 25000;
 
 // Browsing channels. `theme` is the site's own genre id, kept empty for the
 // plain feeds; region/status are the values its filter form posts.
@@ -279,6 +280,27 @@ export default class extends Extension {
 
   async load() {
     this.state();
+    // The chapter list and the reader are served to logged in clients only, so
+    // an account is what makes this source readable. Both fields are optional:
+    // without them the plugin still browses and searches.
+    try {
+      await this.registerSetting({
+        key: 'username',
+        title: '帳號（手機號／信箱）',
+        type: 'input',
+        description: '可選。填寫後章節與閱讀頁才能載入；只用於在官網取得登入 token，僅保存在本機。',
+        defaultValue: '',
+      });
+      await this.registerSetting({
+        key: 'password',
+        title: '密碼',
+        type: 'password',
+        description: '僅保存在本機，用於換取登入 token。',
+        defaultValue: '',
+      });
+    } catch (error) {
+      // runtimes without a settings ui simply stay anonymous
+    }
   }
 
   // the cipher lives at module scope; this mirrors it on the class so the
@@ -344,6 +366,110 @@ export default class extends Extension {
     return value;
   }
 
+  // ---------- login ----------
+
+  // The site hands out a token to a logged in client and serves the chapter list
+  // and the reader pages to it; anonymous clients get an empty list and an empty
+  // contentKey. The form is the site's own: the password travels as
+  // base64("<plain>-<salt>") with a six digit salt taken from the clock.
+  async credentials() {
+    this.state();
+    if (this._credentials !== undefined) return this._credentials;
+    let username = '';
+    let password = '';
+    try {
+      username = String((await this.getSetting('username')) || '').trim();
+      password = String((await this.getSetting('password')) || '');
+    } catch (error) {
+      username = '';
+      password = '';
+    }
+    this._credentials = username && password ? { username, password } : null;
+    return this._credentials;
+  }
+
+  async token() {
+    this.state();
+    if (this._token) return this._token;
+    if (this._tokenPending) return this._tokenPending;
+    const stored = await this.getSetting('token').catch(() => '');
+    if (stored) {
+      this._token = String(stored);
+      return this._token;
+    }
+    const credentials = await this.credentials();
+    if (!credentials) return '';
+
+    this._tokenPending = (async () => {
+      const salt = (Date.now() % 900000) + 100000;
+      const encoded = this.base64(`${credentials.password}-${salt}`);
+      const body = [
+        `username=${encodeURIComponent(credentials.username)}`,
+        `password=${encodeURIComponent(encoded)}`,
+        `salt=${salt}`,
+        'platform=2',
+        'version=1.0.0',
+        'source=copyweb',
+      ].join('&');
+      const site = await this.entry();
+      const raw = await this.requestText(site + '/api/v1/login', {
+        method: 'POST',
+        data: body,
+        headers: {
+          ...this.pageHeaders(),
+          'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+          'X-Requested-With': 'XMLHttpRequest',
+          Accept: 'application/json',
+        },
+        allowErrorStatus: true,
+        timeoutMs: REQUEST_TIMEOUT_MS,
+        retry: 1,
+      });
+      let payload;
+      try {
+        payload = JSON.parse(raw);
+      } catch (error) {
+        throw new Error('登入回應無法解析，請稍後再試。');
+      }
+      const issued = payload && payload.results && payload.results.token;
+      if (!issued) {
+        const message = String((payload && payload.message) || '').trim();
+        throw new Error(`登入失敗：${message || '站點未返回 token'}。請在設定中檢查帳號密碼。`);
+      }
+      this._token = String(issued);
+      await this.setSetting('token', this._token).catch(() => {});
+      return this._token;
+    })();
+
+    try {
+      return await this._tokenPending;
+    } finally {
+      this._tokenPending = null;
+    }
+  }
+
+  async authHeaders() {
+    const token = await this.token().catch(() => '');
+    return token ? { Cookie: `token=${token}`, Authorization: `Token ${token}` } : {};
+  }
+
+  // base64 of a short utf-8 string (btoa is not guaranteed to exist in QuickJS)
+  base64(text) {
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    const bytes = textToBytes(String(text));
+    let out = '';
+    for (let i = 0; i < bytes.length; i += 3) {
+      const b0 = bytes[i];
+      const b1 = i + 1 < bytes.length ? bytes[i + 1] : 0;
+      const b2 = i + 2 < bytes.length ? bytes[i + 2] : 0;
+      out += alphabet[b0 >> 2];
+      out += alphabet[((b0 & 0x03) << 4) | (b1 >> 4)];
+      out += i + 1 < bytes.length ? alphabet[((b1 & 0x0f) << 2) | (b2 >> 6)] : '=';
+      out += i + 2 < bytes.length ? alphabet[b2 & 0x3f] : '=';
+    }
+    return out;
+  }
+
   pathWord(url) {
     const text = String(url || '').trim();
     const match = text.match(/\/comic\/([^/?#]+)/);
@@ -368,9 +494,13 @@ export default class extends Extension {
         try {
           // A full page rather than limit=1: the trimmed variant is only a few
           // kb and some hosts answer it with a shell that carries no links.
+          // No allowErrorStatus here: a non-2xx answer should surface as an
+          // error with its status code, not as a short body we then call
+          // "too short". The caller turns that error into the failure note.
           const body = await this.requestText(site + '/newest', {
             headers: this.pageHeaders(),
-            allowErrorStatus: true,
+            timeoutMs: REQUEST_TIMEOUT_MS,
+            retry: 1,
           });
           const problem = this.describePage(body);
           if (problem) {
@@ -409,7 +539,10 @@ export default class extends Extension {
   describePage(body) {
     const text = String(body || '');
     if (!text) return '空白回應';
-    if (text.length < 400) return `頁面過短（${text.length} 字元）：${text.replace(/\s+/g, ' ').slice(0, 60)}`;
+    if (text.length < 400) {
+      const raw = text.replace(/\s+/g, ' ').slice(0, 80);
+      return `頁面過短（${text.length} 字元，內容：${raw}）`;
+    }
     if (/Just a moment|Attention Required|cf-bluemix|__cf_chl/i.test(text)) return '被 Cloudflare 攔截';
     if (/請到官網更新|伺服器升級|服务器升级/.test(text)) return '站點要求更新 App';
     if (/\/comic\/[\w-]/.test(text)) return '';
@@ -437,13 +570,16 @@ export default class extends Extension {
   async fetch(path, headers) {
     const target = /^https?:\/\//i.test(path) ? String(path).replace(/^https?:\/\/[^/]+/i, '') : path;
     const site = await this.entry();
-    const merged = { ...this.pageHeaders(), ...(headers || {}) };
+    const merged = { ...this.pageHeaders(), ...(await this.authHeaders()), ...(headers || {}) };
+    // an explicit timeout: the runtime default is short for a 70 kb page, and a
+    // silent truncation arrives here looking like an empty body
+    const options = { headers: merged, allowErrorStatus: true, timeoutMs: REQUEST_TIMEOUT_MS, retry: 1 };
     try {
-      return await this.requestText(site + target, { headers: merged, allowErrorStatus: true });
+      return await this.requestText(site + target, options);
     } catch (error) {
       this._entry = '';
       const retrySite = await this.entry();
-      return this.requestText(retrySite + target, { headers: merged, allowErrorStatus: true });
+      return this.requestText(retrySite + target, options);
     }
   }
 
