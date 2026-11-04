@@ -536,19 +536,18 @@ export default class extends Extension {
   }
 
   // Why a probe response is unusable, or '' when it looks like a listing page.
+  // The marker decides, not the length: a legitimate page can be short when the
+  // host trims its shell, and a long page can still be a block screen.
   describePage(body) {
     const text = String(body || '');
-    if (!text) return '空白回應';
-    if (text.length < 400) {
-      const raw = text.replace(/\s+/g, ' ').slice(0, 80);
-      return `頁面過短（${text.length} 字元，內容：${raw}）`;
-    }
+    if (!text.trim()) return '空白回應';
     if (/Just a moment|Attention Required|cf-bluemix|__cf_chl/i.test(text)) return '被 Cloudflare 攔截';
     if (/請到官網更新|伺服器升級|服务器升级/.test(text)) return '站點要求更新 App';
     if (/\/comic\/[\w-]/.test(text)) return '';
     if (/exemptComic/.test(text)) return '';
     const title = (text.match(/<title[^>]*>([\s\S]{0,80}?)<\/title>/i) || [])[1] || '';
-    return `不是預期的頁面${title ? `（${title.trim().slice(0, 30)}）` : ''}，長度 ${text.length}`;
+    const raw = text.replace(/\s+/g, ' ').slice(0, 80);
+    return `不是預期的頁面${title ? `（${title.trim().slice(0, 30)}）` : ''}，${text.length} 字元：${raw}`;
   }
 
   async requestText(url, options) {
