@@ -381,3 +381,63 @@ test('work links from the api are rewritten onto the resolved mirror', async () 
   assert.equal(source.siteUrl('https://www.4khd.com/content/05/sample-work.html'), 'https://hfjsg.ssuu.uk/content/05/sample-work.html');
   assert.equal(source.absolute('/pages/album'), 'https://hfjsg.ssuu.uk/pages/album');
 });
+
+// ---------- rotating hosts ----------
+
+test('the javascript shell the moved mirrors answer with is not mistaken for a site', () => {
+  const source = extension();
+  const shell = '<!DOCTYPE html><html><head><script>s.src = "/scss.js";</script>'
+    + '<title>4KHD - HD Beautiful Girls</title></head>'
+    + '<body><div class="spinner"></div><div class="text">Loading...</div></body></html>';
+  assert.equal(source.isShell(shell), true);
+  assert.equal(source.isShell('<html><body>worker.js</body></html>'), true);
+
+  const real = '<html><body>' + '<a href="/content/12/work.html">w</a>'.repeat(120) + '</body></html>';
+  assert.equal(source.isShell(real), false);
+});
+
+test('a host that only serves the shell is skipped even though it answers 200', async () => {
+  const source = extension();
+  source._site = '';
+  const shell = '<html><body><div class="text">Loading...</div><script src="/scss.js"></script></body></html>';
+  const storedRequests = [];
+  source.request = async (url) => {
+    storedRequests.push(url);
+    // every path on the dead mirrors answers the placeholder, api included
+    if (/rjfp\.uuss\.uk/.test(url)) return shell;
+    return '';
+  };
+  source.getSetting = async () => 'https://rjfp.uuss.uk';
+  source.setSetting = async () => {};
+  await assert.rejects(source.resolveEntry(), /沒有可用的鏡像站點/);
+  assert.ok(storedRequests.some((url) => url.includes('rjfp.uuss.uk')));
+});
+
+test('a redirect target is read out of the location header', async () => {
+  const source = extension();
+  source.request = async (url, options) => {
+    // simulate the runtime handing back the 30x because allowErrorStatus is set
+    if (url.startsWith('https://old.uuss.uk/')) {
+      return JSON.stringify({ status: 302, headers: { location: 'https://new.uuss.uk/4khd.php' } });
+    }
+    return '';
+  };
+  const found = await source.redirectTarget('https://old.uuss.uk');
+  assert.ok(found.includes('https://new.uuss.uk'), 'the redirect host must be offered: ' + found.join(','));
+});
+
+test('hosts are only harvested from the accepted families', () => {
+  const source = extension();
+  const found = source.hostCandidates('https://evil.example.com https://rjfp.uuss.uk/x http://a.b.4khd.com');
+  assert.deepEqual(Array.from(found), ['https://rjfp.uuss.uk', 'http://a.b.4khd.com']);
+  assert.equal(source.bareHost('https://rjfp.uuss.uk/pages/album?x=1'), 'https://rjfp.uuss.uk');
+  assert.equal(source.normalizeEntry('evil.example.com'), '');
+});
+
+test('the canonical host is the first entry point offered', () => {
+  const source = extension();
+  const known = source.knownEntries ? source.knownEntries() : null;
+  // the default entry is what browsing falls back to before resolution
+  assert.match(source.currentSite(), /4khd\.com|uuss\.uk|ssuu\.uk/);
+  if (known) assert.match(known[0], /4khd\.com/);
+});

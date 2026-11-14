@@ -1,13 +1,13 @@
 // ==MiruExtension==
 // @name         4KHD 圖集
-// @version      v1.1.0
+// @version      v1.2.0
 // @author       FusionReader
 // @lang         all
 // @license      MIT
 // @package      fourkhd
 // @type         manga
-// @icon         https://vxhh.uuss.uk/wp-content/uploads/2023/02/4khd-1-150x150.png
-// @webSite      https://vxhh.uuss.uk
+// @icon         https://4khd.com/wp-content/uploads/2023/02/4khd-1-150x150.png
+// @webSite      https://4khd.com
 // @nsfw         true
 // @network      auto
 // ==/MiruExtension==
@@ -41,10 +41,25 @@
 // content prints them.
 
 // Mirrors rotate their host; only these families are accepted as entry points.
-const DEFAULT_ENTRY = 'https://vxhh.uuss.uk';
-const KNOWN_ENTRIES = ['https://vxhh.uuss.uk', 'https://usti.uuss.uk', 'https://hfjsg.ssuu.uk'];
+//
+// Order matters and is measured (2026-11-14): the canonical host is listed first
+// because the uuss.uk / ssuu.uk mirrors have turned into javascript shells that
+// answer *every* path — including /wp-json — with the same 2 kb "Loading…" page.
+// They still work as signposts though: their /4khd.php landing script carries
+// `sites = ['https://…']`, which is how the current host is discovered.
+const DEFAULT_ENTRY = 'https://4khd.com';
+const KNOWN_ENTRIES = [
+  'https://4khd.com',
+  'https://rjfp.uuss.uk',
+  'https://dsad.ssuu.uk',
+  'https://vxhh.uuss.uk',
+  'https://usti.uuss.uk',
+  'https://hfjsg.ssuu.uk',
+];
 const MIRROR_HOSTS = /^(?:[a-z0-9-]+\.)*(?:uuss\.uk|ssuu\.uk|4khd\.com)$/i;
 const CANONICAL_HOSTS = /^(?:www\.|m)?4khd\.com$/i;
+// The landing page the rotating mirrors use to point at the live host.
+const LANDING_PATHS = ['/4khd.php', '/'];
 
 
 // Curated listing pages, in the order the app shows them.
@@ -158,33 +173,75 @@ export default class extends Extension {
         observed.push(candidate);
         push(candidate);
       }
+      // A dead host often points at its replacement: read the redirect it answers
+      // with, and any host its landing script names, then try those next.
+      for (const candidate of await this.redirectTarget(site)) {
+        if (!this.normalizeEntry(candidate)) continue;
+        observed.push(candidate);
+        push(candidate);
+      }
     }
     throw new Error(
       '沒有可用的鏡像站點。\n'
-      + '站點會不定期更換域名，插件已嘗試已知鏡像與落地頁列出的地址。\n'
+      + '站點會不定期更換域名，插件已嘗試已知鏡像、落地頁列出的地址與轉跳目標。\n'
       + '可稍後重試，或在插件設置的「站點入口」裡手動填寫當前鏡像地址。'
     );
   }
 
-  // A mirror is considered usable when its own api answers with JSON; anything
-  // else (a "site moved" landing page, a block page) is treated as moved.
+  // A mirror is usable when its api answers with JSON *and* its listing page
+  // carries work links. Both are checked: the uuss.uk mirrors now answer every
+  // path with the same 2 kb javascript shell, which is neither, and the canonical
+  // host serves real html even though it does not always keep /wp-json open.
   async probeEntry(site) {
+    const listed = [];
+    let apiOk = false;
     let body = '';
     try {
       const response = await this.request(`${site}/wp-json/wp/v2/categories?per_page=1`, {
         headers: { 'Accept-Language': 'zh-TW,zh;q=0.9', Accept: 'application/json' },
+        allowErrorStatus: true,
+        retry: 0,
       });
       body = typeof response === 'string' ? response : JSON.stringify(response);
     } catch (error) {
-      return { ok: false, listed: [] };
+      body = '';
     }
+    if (!this.isShell(body)) {
+      try {
+        apiOk = Array.isArray(JSON.parse(body));
+      } catch (error) {
+        apiOk = false;
+      }
+    }
+    // an api that answers with a real array is enough: the shell hosts answer
+    // this path with their placeholder page, which is caught by isShell above
+    if (apiOk) return { ok: true, listed: [] };
+    for (const candidate of this.landingCandidates(body)) listed.push(candidate);
+
+    // no api: judge by the listing page, which is what browsing actually uses
     try {
-      const payload = JSON.parse(body);
-      if (Array.isArray(payload)) return { ok: true, listed: [] };
+      const response = await this.request(`${site}${DEFAULT_PAGE}`, {
+        headers: { 'Accept-Language': 'zh-TW,zh;q=0.9', Accept: 'text/html,*/*' },
+        allowErrorStatus: true,
+        retry: 0,
+      });
+      const html = typeof response === 'string' ? response : JSON.stringify(response);
+      if (!this.isShell(html) && /\/content\/\d+\//.test(html)) return { ok: true, listed: [] };
+      for (const candidate of this.landingCandidates(html)) listed.push(candidate);
+      for (const candidate of this.hostCandidates(html)) listed.push(candidate);
     } catch (error) {
-      // fall through: the body may be the landing page
+      // unreachable hosts simply stay unusable
     }
-    return { ok: false, listed: this.landingCandidates(body) };
+    return { ok: false, listed };
+  }
+
+  // The "site moved" hosts answer every path — api included — with one small
+  // page that only boots a service worker. It carries no content, so it must not
+  // be mistaken for a working mirror.
+  isShell(body) {
+    const text = String(body || '');
+    if (text.length > 4000) return false;
+    return /Loading\.\.\./i.test(text) || /scss\.js|worker\.js/i.test(text);
   }
 
   // The old host answers with a script that probes its own candidate list:
@@ -196,6 +253,58 @@ export default class extends Extension {
     const found = [];
     for (const quoted of list[1].match(/['"]([^'"]+)['"]/g) || []) found.push(quoted.replace(/['"]/g, ''));
     return found;
+  }
+
+  // A host that moved answers with 30x and a Location header. The runtime follows
+  // redirects on its own, so the target has to be read from a request that is
+  // allowed to answer with the redirect: `allowErrorStatus` keeps the 30x instead
+  // of turning it into an error. Whatever host the Location names is returned so
+  // the caller can add it to the candidate queue.
+  async redirectTarget(site) {
+    const candidates = [];
+    for (const path of LANDING_PATHS) {
+      try {
+        const response = await this.request(`${site}${path}`, {
+          headers: { 'Accept-Language': 'zh-CN,zh;q=0.9', Accept: 'text/html,*/*' },
+          allowErrorStatus: true,
+          retry: 0,
+        });
+        // the runtime may hand back a body, a status, or a wrapper; read all of it
+        const text = typeof response === 'string' ? response : JSON.stringify(response);
+        if (typeof response === 'object' && response) {
+          const location = response.headers && (response.headers.location || response.headers.Location);
+          if (location) candidates.push(location);
+          if (response.url) candidates.push(response.url);
+        }
+        // a followed redirect leaves no Location behind, so mine the body too
+        const fromBody = String(text).match(/(?:location(?:\.href)?\s*=\s*|href=")(https?:\/\/[^"'\s;>]+)/i);
+        if (fromBody) candidates.push(fromBody[1]);
+        for (const listed of this.landingCandidates(text)) candidates.push(listed);
+        for (const found of this.hostCandidates(text)) candidates.push(found);
+      } catch (error) {
+        continue;
+      }
+    }
+    const hosts = [];
+    for (const candidate of candidates) {
+      const entry = this.normalizeEntry(/(?:^|\/\/)([^/?#]+)/.test(String(candidate)) ? this.bareHost(candidate) : candidate);
+      if (entry && !hosts.includes(entry)) hosts.push(entry);
+    }
+    return hosts;
+  }
+
+  // pull bare hosts out of an arbitrary body, but only within the accepted families
+  hostCandidates(text) {
+    const found = [];
+    const pattern = /(?:https?:\/\/)?(?:[a-z0-9-]+\.)*(?:uuss\.uk|ssuu\.uk|4khd\.com)/gi;
+    for (const match of String(text || '').match(pattern) || []) found.push(match);
+    return found;
+  }
+
+  // "https://host/some/path" -> "https://host"
+  bareHost(value) {
+    const match = String(value || '').match(/^(https?:\/\/[^/?#]+)/i);
+    return match ? match[1] : '';
   }
 
   normalizeEntry(value) {
